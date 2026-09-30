@@ -1,28 +1,23 @@
 name: 小米6 sagit 内核自动构建
 
 on:
-  workflow_dispatch:   # 手动触发：仓库页面 → Actions → 选本工作流 → Run workflow
+  workflow_dispatch:
 
 jobs:
   build:
-    name: Build sagit (ReSukiSU + SUSFS)
-    # 22.04：ubuntu-latest 已是 24.04，工具链过新，编 4.4 老内核易失败
+    name: Build sagit (ReSukiSU)
     runs-on: ubuntu-22.04
-    # 安全限制：只允许仓库所有者触发
     if: github.event.repository.owner.id == github.event.sender.id
 
     steps:
 
-    # ── 1. 拉取本仓库（只含 build.yml / config.env / patches）──
     - name: 拉取构建脚本仓库
       uses: actions/checkout@v4
 
-    # ── 2. 读取 config.env 开关 ──
     - name: 读取编译配置
       run: |
-        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|ENABLE_SET_MEMORY|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV
+        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV
 
-    # ── 3. 安装依赖（静默 + 精简，缩短安装耗时）──
     - name: 安装编译依赖
       run: |
         sudo apt-get update -qq
@@ -35,7 +30,6 @@ jobs:
         sudo ln -sf /usr/bin/python3 /usr/bin/python || true
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
-    # ── 4. 下载谷歌 clang 12.0.5 ──
     - name: 下载 clang 12.0.5
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
@@ -44,7 +38,6 @@ jobs:
           -b android12-release clang-aosp
         ls clang-aosp/clang-r416183b/bin/clang
 
-    # ── 5. 下载内核源码 ──
     - name: 下载内核源码
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
@@ -52,7 +45,8 @@ jobs:
           -b ${{ env.KERNEL_SOURCE_BRANCH }} \
           android-kernel --depth=1
 
-    # ── 6. 集成 ReSukiSU（先清掉源码自带旧 KSU，防两套冲突）──
+    # 集成 ReSukiSU：先清掉源码自带的旧 KernelSU，防两套代码冲突
+    # 4.4 走 manual hook，已开 CONFIG_KSU_MANUAL_HOOK
     - name: 集成 ReSukiSU
       if: env.ENABLE_KERNELSU == 'true'
       run: |
@@ -60,10 +54,12 @@ jobs:
         rm -rf KernelSU drivers/kernelsu
         git checkout -- . 2>/dev/null || true
         curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+        if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
+        echo "KSU 目录: $KSU_DIR"
+        ls "$KSU_DIR"
 
-    # ── 7. 下载 SUSFS（多源回退）──
-    # 原 github.com/simonpunk/susfs4ksu 已不存在（迁 GitLab），故改用镜像源
-    # GIT_TERMINAL_PROMPT=0 防止仓库不存在时卡在用户名输入
+    # ===== 以下 SUSFS 步骤：ENABLE_SUSFS=false 时全部自动跳过 =====
+
     - name: 下载 SUSFS
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -87,20 +83,18 @@ jobs:
         done
         if [ "$OK" != "1" ]; then
           rm -rf susfs
-          echo "⚠ 所有 SUSFS 源均失败，本次降级为仅 ReSukiSU 编译"
+          echo "⚠ SUSFS 源不可用，降级为仅 ReSukiSU"
           echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
         else
-          echo "--- kernel_patches 内容 ---"
           ls susfs/kernel_patches/
         fi
 
-    # ── 8. 注入 SUSFS 源文件 ──
     - name: 注入 SUSFS 文件
       if: env.ENABLE_SUSFS == 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         K=android-kernel
-        # 兼容两种目录布局：kernel_patches/fs 或 fs
+        SRC=""; HDR=""
         for D in susfs/kernel_patches/fs susfs/fs; do
           [ -f "$D/susfs.c" ] && SRC="$D" && break
         done
@@ -116,29 +110,7 @@ jobs:
         cp "$HDR/susfs.h"            $K/include/linux/susfs.h
         [ -f "$HDR/susfs_def.h" ] && cp "$HDR/susfs_def.h" $K/include/linux/susfs_def.h
         grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
-        echo "✅ SUSFS 文件已注入"
 
-    # ── 9. 4.4 内核 set_memory 反向移植（可选，失败不中断）──
-    # 4.4 缺 set_memory，ReSukiSU/SUSFS 需要；补丁来自 NonGKI 项目
-    - name: set_memory 反向移植
-      if: env.ENABLE_SET_MEMORY == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        for U in \
-          "https://raw.githubusercontent.com/takahashikajima/NonGKI/main/Patch/set_memory_to_49_and_low.patch" \
-          "https://raw.githubusercontent.com/takahashikajima/NonGKI/master/Patch/set_memory_to_49_and_low.patch" ; do
-          curl -LSsf -o set_memory.patch "$U" && break
-          rm -f set_memory.patch
-        done
-        if [ -s set_memory.patch ] && grep -q "^diff --git\|^--- " set_memory.patch; then
-          cd android-kernel
-          patch -p1 --fuzz=5 --no-backup-if-mismatch < ../set_memory.patch \
-            || echo "⚠ set_memory 补丁有冲突，请查看 .rej"
-        else
-          echo "⚠ 未获取到 set_memory 补丁，跳过（4.4 若报 set_memory 错误需手动补）"
-        fi
-
-    # ── 10. 应用 SUSFS 内核侧补丁（文件名自动探测）──
     - name: 应用 SUSFS 内核补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -152,25 +124,41 @@ jobs:
           [ -f "$f" ] && P="$f" && break
         done
         if [ -z "$P" ]; then
-          echo "⚠ 未找到 SUSFS 内核补丁，降级为仅 ReSukiSU"
+          echo "⚠ 未找到补丁，降级为仅 ReSukiSU"
           echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
           exit 0
         fi
         echo "==> 使用补丁: $P"
         patch -p1 --fuzz=5 --no-backup-if-mismatch < "$P" \
-          || echo "⚠ SUSFS 内核补丁有冲突，请查看 .rej 文件"
+          || echo "⚠ 补丁有冲突"
+        REJ=$(find . -name "*.rej" 2>/dev/null | head -20)
+        if [ -n "$REJ" ]; then
+          echo "⚠ 冲突残留，自动降级关闭 SUSFS："
+          echo "$REJ"
+          find . -name "*.rej" -delete
+          find . -name "*.orig" -delete
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+        fi
 
-    # ── 11. 应用 SUSFS 的 KSU 侧补丁 ──
     - name: 应用 SUSFS 的 KSU 补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
-        cd $KSU_DIR
+        if [ ! -d "$KSU_DIR" ]; then
+          echo "⚠ 未找到 $KSU_DIR，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+          exit 0
+        fi
+        cd "$KSU_DIR" || exit 0
         PATCHES=$(ls ../../susfs/kernel_patches/KernelSU/*.patch ../../susfs/kernel_patches/KSU/*.patch 2>/dev/null)
         if [ -z "$PATCHES" ]; then
-          echo "⚠ 未找到 KSU 侧补丁，尝试根目录 10_enable_susfs_for_ksu.patch"
           PATCHES=$(ls ../../susfs/kernel_patches/10_enable_susfs_for_ksu.patch 2>/dev/null)
+        fi
+        if [ -z "$PATCHES" ]; then
+          echo "⚠ 无 KSU 侧补丁，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+          exit 0
         fi
         for p in $PATCHES; do
           [ -f "$p" ] || continue
@@ -178,7 +166,8 @@ jobs:
           patch -p1 --fuzz=5 < "$p" || echo "⚠ 冲突: $p"
         done
 
-    # ── 12. 应用自定义补丁（修上面冲突用）──
+    # ===== SUSFS 步骤结束 =====
+
     - name: 应用自定义补丁
       if: env.ENABLE_CUSTOM_PATCHES == 'true'
       run: |
@@ -189,26 +178,20 @@ jobs:
           git apply --3way "$p" || patch -p1 --fuzz=3 < "$p" || echo "⚠ 失败: $p"
         done
 
-    # ── 13. ccache 缓存 ──
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2.11
       with:
-        key: build-kernel-sagit-44-resukisu-susfs
+        key: build-kernel-sagit-44-resukisu
         max-size: 2G
 
-    # ── 14. 编译内核 ──
     - name: 编译内核
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
 
-        # ① 生成基础 defconfig
         make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }}
-
-        # ② 叠加机型片段
         cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
 
-        # ③ 关键修正 + 开启 KSU/SUSFS
         cat >> out/.config <<'EOF'
         CONFIG_LOCALVERSION="-ReSukiSU"
         # CONFIG_CC_WERROR is not set
@@ -220,17 +203,14 @@ jobs:
 
         if [ "${{ env.ENABLE_KERNELSU }}" = "true" ]; then
           echo "CONFIG_KSU=y" >> out/.config
-          # 4.4 老内核用 manual hook 最兼容（ReSukiSU 支持 3.4+）
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
         fi
         if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
           echo "CONFIG_KSU_SUSFS=y" >> out/.config
         fi
 
-        # ④ 解决依赖冲突
         make O=out ARCH=arm64 olddefconfig
 
-        # ⑤ 正式编译
         make -j$(nproc --all) \
           CC="ccache clang" \
           O=out \
@@ -238,14 +218,12 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-        # ⑥ 检查产物
         if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
           echo "::error::未生成 Image.gz-dtb，编译失败，请查看上方日志"
           exit 1
         fi
         ls -lh out/arch/arm64/boot/Image.gz-dtb
 
-    # ── 15. AnyKernel3 打包 ──
     - name: 打包 AnyKernel3
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
@@ -257,7 +235,6 @@ jobs:
         rm -rf AnyKernel3/.git* AnyKernel3/README.md \
                AnyKernel3/ramdisk AnyKernel3/modules AnyKernel3/patch
 
-    # ── 16. 上传刷机包 ──
     - name: 上传产物
       uses: actions/upload-artifact@v4
       with:
