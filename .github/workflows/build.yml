@@ -6,7 +6,8 @@ on:
 jobs:
   build:
     name: Build sagit (ReSukiSU + SUSFS)
-    runs-on: ubuntu-latest
+    # 用 22.04：ubuntu-latest 已是 24.04，该版本移除了 python2 且工具链过新，编 4.4 老内核易失败
+    runs-on: ubuntu-22.04
     # 安全限制：只允许仓库所有者触发，防止 fork 被他人恶意跑
     if: github.event.repository.owner.id == github.event.sender.id
 
@@ -22,7 +23,7 @@ jobs:
         grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|SUSFS_KERNEL_PATCH|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV
 
     # ── 3. 安装依赖 ──
-    # python2 保留：4.4 老内核部分脚本仍依赖它
+    # 不装 python2（22.04/24.04 源里已无此包），改用 python-is-python3 让 python 命令指向 python3
     - name: 安装编译依赖
       run: |
         sudo apt update
@@ -30,8 +31,11 @@ jobs:
           git make bc bison flex libelf-dev ccache \
           openssl libssl-dev zip kmod cpio curl wget \
           device-tree-compiler ca-certificates \
-          python3 python2 \
+          python3 python-is-python3 \
           binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+        # 保险：确保 python 命令存在
+        sudo ln -sf /usr/bin/python3 /usr/bin/python || true
+        python --version
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     # ── 4. 清理磁盘（内核 + clang 体积大，runner 空间不足会中途失败）──
