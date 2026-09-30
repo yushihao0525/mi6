@@ -1,0 +1,204 @@
+name: 小米6 sagit 内核自动构建
+
+on:
+  workflow_dispatch:   # 手动触发：仓库页面 → Actions → 选本工作流 → Run workflow
+
+jobs:
+  build:
+    name: Build sagit (ReSukiSU + SUSFS)
+    runs-on: ubuntu-latest
+    # 安全限制：只允许仓库所有者触发，防止 fork 被他人恶意跑
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+
+    # ── 1. 拉取本仓库（只含 build.yml / config.env / patches，很小）──
+    - name: 拉取构建脚本仓库
+      uses: actions/checkout@v3
+
+    # ── 2. 读取 config.env 中所有开关（注释行以 # 开头，不会被读走）──
+    - name: 读取编译配置
+      run: |
+        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|SUSFS_KERNEL_PATCH|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV
+
+    # ── 3. 安装依赖 ──
+    # python2 保留：4.4 老内核部分脚本仍依赖它
+    - name: 安装编译依赖
+      run: |
+        sudo apt update
+        sudo apt -y install \
+          git make bc bison flex libelf-dev ccache \
+          openssl libssl-dev zip kmod cpio curl wget \
+          device-tree-compiler ca-certificates \
+          python3 python2 \
+          binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    # ── 4. 清理磁盘（内核 + clang 体积大，runner 空间不足会中途失败）──
+    - name: 清理无用磁盘占用
+      run: |
+        df -h
+        sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet /opt/ghc 2>/dev/null || true
+        df -h
+
+    # ── 5. 下载谷歌 clang 12.0.5（android12-release 分支内含 clang-r416183b）──
+    - name: 下载 clang 12.0.5
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone -q --depth=1 --single-branch \
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+          -b android12-release clang-aosp
+        # 确认编译器就位
+        ls clang-aosp/clang-r416183b/bin/clang
+
+    # ── 6. 下载内核源码（源码与构建仓库分离，改 config.env 即可换源）──
+    - name: 下载内核源码
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone ${{ env.KERNEL_SOURCE }} \
+          -b ${{ env.KERNEL_SOURCE_BRANCH }} \
+          android-kernel --depth=1
+
+    # ── 7. 集成 ReSukiSU ──
+    # 先删掉源码自带的旧 KernelSU，避免两套代码冲突
+    # 4.4 内核走 legacy（kprobe）模式，需 CONFIG_KPROBES（defconfig 已开）
+    - name: 集成 ReSukiSU
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        rm -rf KernelSU drivers/kernelsu
+        git checkout -- . 2>/dev/null || true
+        curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+    # ── 8. 下载 SUSFS ──
+    # 注意：官方 susfs4ksu 最低 kernel-4.9，小米6 是 4.4，属 backport 移植
+    # 补丁大概率有冲突 → 用 patches/ 目录里的自定义补丁修 .rej
+    - name: 下载 SUSFS
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone --depth=1 -b ${{ env.SUSFS_BRANCH }} \
+          https://github.com/simonpunk/susfs4ksu.git susfs
+
+    # ── 9. 把 SUSFS 源文件塞进内核树并挂上编译 ──
+    - name: 注入 SUSFS 文件
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        K=android-kernel
+        cp susfs/fs/susfs.c                $K/fs/susfs.c
+        cp susfs/include/linux/susfs.h     $K/include/linux/susfs.h
+        cp susfs/include/linux/susfs_def.h $K/include/linux/susfs_def.h
+        # 让 fs/Makefile 编译 susfs.c（已存在则不重复添加）
+        grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
+
+    # ── 10. 打内核侧补丁（fs / include 等）──
+    - name: 应用 SUSFS 内核补丁
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        patch -p1 --fuzz=5 --no-backup-if-mismatch \
+          < ../susfs/kernel_patches/${{ env.SUSFS_KERNEL_PATCH }} \
+          || echo "⚠ SUSFS 内核补丁有冲突，请查看 .rej 文件"
+
+    # ── 11. 打 KSU 侧补丁（让 KernelSU 调用 susfs）──
+    - name: 应用 SUSFS 的 KSU 补丁
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # ReSukiSU / KernelSU 目录名可能不同，自动识别
+        if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
+        cd $KSU_DIR
+        for p in ../../susfs/kernel_patches/KSU/*.patch; do
+          [ -f "$p" ] || continue
+          echo "==> 打补丁 $p"
+          patch -p1 --fuzz=5 < "$p" || echo "⚠ 冲突: $p"
+        done
+
+    # ── 12. 应用自定义补丁（放 patches/ 目录，用来修上面冲突 / 补 manual hook）──
+    - name: 应用自定义补丁
+      if: env.ENABLE_CUSTOM_PATCHES == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        for p in ${{ github.workspace }}/patches/*.patch; do
+          [ -f "$p" ] || continue
+          echo "==> $p"
+          git apply --3way "$p" || patch -p1 --fuzz=3 < "$p" || echo "⚠ 失败: $p"
+        done
+
+    # ── 13. ccache 缓存（二次构建大幅提速）──
+    - name: 设置 ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: build-kernel-sagit-44-resukisu-susfs
+        max-size: 2G
+
+    # ── 14. 编译内核 ──
+    - name: 编译内核
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # clang12 加入 PATH
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
+
+        # ① 生成基础 defconfig
+        make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }}
+
+        # ② 叠加机型片段（sagit.config 只有几行差异）
+        cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
+
+        # ③ 关键修正（覆盖 defconfig 里的原值）
+        cat >> out/.config <<'EOF'
+        CONFIG_LOCALVERSION="-ReSukiSU"
+        # CONFIG_CC_WERROR is not set
+        CONFIG_KPROBES=y
+        CONFIG_KPROBE_EVENTS=y
+        EOF
+
+        # ④ 按需开启 KSU / SUSFS
+        if [ "${{ env.ENABLE_KERNELSU }}" = "true" ]; then
+          echo "CONFIG_KSU=y" >> out/.config
+        fi
+        if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
+          echo "CONFIG_KSU_SUSFS=y" >> out/.config
+        fi
+
+        # ⑤ 解决依赖冲突（不加这步，上面的追加项不生效）
+        make O=out ARCH=arm64 olddefconfig
+
+        # ⑥ 正式编译
+        # 固定 clang + GNU binutils（不加 LLVM=1），4.4 老内核这样最稳
+        make -j$(nproc --all) \
+          CC="ccache clang" \
+          O=out \
+          ARCH=arm64 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+        # ⑦ 检查产物是否存在
+        if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
+          echo "::error::未生成 Image.gz-dtb，编译失败，请查看上方日志"
+          exit 1
+        fi
+        ls -lh out/arch/arm64/boot/Image.gz-dtb
+
+    # ── 15. 用 AnyKernel3 打包成可刷 zip ──
+    - name: 打包 AnyKernel3
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone https://github.com/osm0sis/AnyKernel3
+        # 关闭机型校验（小米6 非 A/B 分区，boot 路径固定）
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+        sed -i 's/is_slot_device=1/is_slot_device=0/g' AnyKernel3/anykernel.sh
+        sed -i 's!block=.*!block=/dev/block/bootdevice/by-name/boot;!g' AnyKernel3/anykernel.sh
+        # 放入内核镜像
+        cp android-kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        # 清理多余文件
+        rm -rf AnyKernel3/.git* AnyKernel3/README.md \
+               AnyKernel3/ramdisk AnyKernel3/modules AnyKernel3/patch
+
+    # ── 16. 上传刷机包 ──
+    - name: 上传产物
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ env.KERNEL_ZIP_NAME }}
+        path: kernel_workspace/AnyKernel3/*
