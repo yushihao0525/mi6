@@ -45,8 +45,6 @@ jobs:
           -b ${{ env.KERNEL_SOURCE_BRANCH }} \
           android-kernel --depth=1
 
-    # 集成 ReSukiSU：先清掉源码自带的旧 KernelSU，防两套代码冲突
-    # 4.4 走 manual hook，已开 CONFIG_KSU_MANUAL_HOOK
     - name: 集成 ReSukiSU
       if: env.ENABLE_KERNELSU == 'true'
       run: |
@@ -54,119 +52,33 @@ jobs:
         rm -rf KernelSU drivers/kernelsu
         git checkout -- . 2>/dev/null || true
         curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-        if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
-        echo "KSU 目录: $KSU_DIR"
-        ls "$KSU_DIR"
+        echo "--- KSU 目录 ---"
+        if [ -d KernelSU ]; then ls KernelSU; else ls drivers/kernelsu; fi
 
-    # ===== 以下 SUSFS 步骤：ENABLE_SUSFS=false 时全部自动跳过 =====
-
-    - name: 下载 SUSFS
-      if: env.ENABLE_SUSFS == 'true'
+    # 4.4 老内核缺部分 API，多源尝试拉取兼容补丁，失败不中断
+    - name: 4.4 API 兼容补丁（多源尝试）
+      if: env.ENABLE_KERNELSU == 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         export GIT_TERMINAL_PROMPT=0
-        BR="${{ env.SUSFS_BRANCH }}"
-        OK=0
-        for URL in \
-          "https://github.com/ShirkNeko/susfs4ksu" \
-          "https://github.com/yougotme101/susfs4ksu" \
-          "https://gitlab.com/simonpunk/susfs4ksu" \
-          "https://github.com/Castorice4/susfs4ksu" ; do
-          rm -rf susfs
-          echo "==> 尝试 $URL (分支 $BR)"
-          if git clone -q --depth=1 -b "$BR" "$URL" susfs 2>/dev/null \
-             && [ -d susfs/kernel_patches ]; then
-            echo "✅ SUSFS 拉取成功: $URL"
-            OK=1
-            break
-          fi
+        echo "===== 尝试获取 NonGKI 补丁仓库 ====="
+        for U in \
+          "https://github.com/JackA1ltman/NonGKI_Kernel_Patches" \
+          "https://github.com/ShirkNeko/NonGKI_Kernel_Patches" ; do
+          rm -rf nongki
+          for B in mainline main master; do
+            if git clone -q --depth=1 -b "$B" "$U" nongki 2>/dev/null; then
+              echo "✅ 成功: $U ($B)"
+              break 2
+            fi
+          done
         done
-        if [ "$OK" != "1" ]; then
-          rm -rf susfs
-          echo "⚠ SUSFS 源不可用，降级为仅 ReSukiSU"
-          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+        if [ -d nongki ]; then
+          echo "--- 可用补丁列表 ---"
+          find nongki -name "*.patch" | head -40
         else
-          ls susfs/kernel_patches/
+          echo "⚠ 未获取到 NonGKI 补丁仓库，跳过"
         fi
-
-    - name: 注入 SUSFS 文件
-      if: env.ENABLE_SUSFS == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        K=android-kernel
-        SRC=""; HDR=""
-        for D in susfs/kernel_patches/fs susfs/fs; do
-          [ -f "$D/susfs.c" ] && SRC="$D" && break
-        done
-        for H in susfs/kernel_patches/include/linux susfs/include/linux; do
-          [ -f "$H/susfs.h" ] && HDR="$H" && break
-        done
-        if [ -z "$SRC" ] || [ -z "$HDR" ]; then
-          echo "⚠ susfs 源文件缺失，降级为仅 ReSukiSU"
-          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
-          exit 0
-        fi
-        cp "$SRC/susfs.c"            $K/fs/susfs.c
-        cp "$HDR/susfs.h"            $K/include/linux/susfs.h
-        [ -f "$HDR/susfs_def.h" ] && cp "$HDR/susfs_def.h" $K/include/linux/susfs_def.h
-        grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
-
-    - name: 应用 SUSFS 内核补丁
-      if: env.ENABLE_SUSFS == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        P=""
-        for f in \
-          ../susfs/kernel_patches/50_add_susfs_in_kernel-4.9*.patch \
-          ../susfs/kernel_patches/50_add_susfs_in_kernel-4.4*.patch \
-          ../susfs/kernel_patches/50_add_susfs_in_kernel*.patch \
-          ../susfs/kernel_patches/*add_susfs*.patch ; do
-          [ -f "$f" ] && P="$f" && break
-        done
-        if [ -z "$P" ]; then
-          echo "⚠ 未找到补丁，降级为仅 ReSukiSU"
-          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
-          exit 0
-        fi
-        echo "==> 使用补丁: $P"
-        patch -p1 --fuzz=5 --no-backup-if-mismatch < "$P" \
-          || echo "⚠ 补丁有冲突"
-        REJ=$(find . -name "*.rej" 2>/dev/null | head -20)
-        if [ -n "$REJ" ]; then
-          echo "⚠ 冲突残留，自动降级关闭 SUSFS："
-          echo "$REJ"
-          find . -name "*.rej" -delete
-          find . -name "*.orig" -delete
-          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
-        fi
-
-    - name: 应用 SUSFS 的 KSU 补丁
-      if: env.ENABLE_SUSFS == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
-        if [ ! -d "$KSU_DIR" ]; then
-          echo "⚠ 未找到 $KSU_DIR，降级为仅 ReSukiSU"
-          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
-          exit 0
-        fi
-        cd "$KSU_DIR" || exit 0
-        PATCHES=$(ls ../../susfs/kernel_patches/KernelSU/*.patch ../../susfs/kernel_patches/KSU/*.patch 2>/dev/null)
-        if [ -z "$PATCHES" ]; then
-          PATCHES=$(ls ../../susfs/kernel_patches/10_enable_susfs_for_ksu.patch 2>/dev/null)
-        fi
-        if [ -z "$PATCHES" ]; then
-          echo "⚠ 无 KSU 侧补丁，降级为仅 ReSukiSU"
-          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
-          exit 0
-        fi
-        for p in $PATCHES; do
-          [ -f "$p" ] || continue
-          echo "==> 打补丁 $p"
-          patch -p1 --fuzz=5 < "$p" || echo "⚠ 冲突: $p"
-        done
-
-    # ===== SUSFS 步骤结束 =====
 
     - name: 应用自定义补丁
       if: env.ENABLE_CUSTOM_PATCHES == 'true'
@@ -185,11 +97,15 @@ jobs:
         max-size: 2G
 
     - name: 编译内核
+      id: build
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
 
-        make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }}
+        echo "===== ① 生成 defconfig ====="
+        make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }} 2>&1 | tail -20
+
+        echo "===== ② 叠加 sagit 片段 ====="
         cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
 
         cat >> out/.config <<'EOF'
@@ -205,24 +121,48 @@ jobs:
           echo "CONFIG_KSU=y" >> out/.config
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
         fi
-        if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
-          echo "CONFIG_KSU_SUSFS=y" >> out/.config
-        fi
 
-        make O=out ARCH=arm64 olddefconfig
+        echo "===== ③ olddefconfig ====="
+        make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
 
+        echo "===== ④ 确认关键 config ====="
+        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_CC_WERROR" out/.config
+
+        echo "===== ⑤ 正式编译 ====="
         make -j$(nproc --all) \
           CC="ccache clang" \
           O=out \
           ARCH=arm64 \
           CROSS_COMPILE=aarch64-linux-gnu- \
-          CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          > build.log 2>&1
+        echo "make 退出码: $?"
 
         if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
-          echo "::error::未生成 Image.gz-dtb，编译失败，请查看上方日志"
+          echo "########## 全部 error 行 ##########"
+          grep -nE "error:|error\[|Error [0-9]+|fatal error|undefined reference|No such file" build.log | head -40
+          echo "########## drivers/kernelsu 相关 ##########"
+          grep -nE "drivers/kernelsu" build.log | head -40
+          echo "########## 第一个 error 上下文 ##########"
+          FIRST=$(grep -n "error:" build.log | head -1 | cut -d: -f1)
+          if [ -n "$FIRST" ]; then
+            S=$((FIRST>20 ? FIRST-20 : 1))
+            sed -n "${S},$((FIRST+20))p" build.log
+          fi
+          echo "########## 日志末尾 60 行 ##########"
+          tail -60 build.log
+          echo "::error::编译失败，完整日志见 artifact build-log"
           exit 1
         fi
         ls -lh out/arch/arm64/boot/Image.gz-dtb
+
+    # 编译失败也把完整日志传上来，方便定位（关键）
+    - name: 上传编译日志（失败时）
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: kernel_workspace/android-kernel/build.log
 
     - name: 打包 AnyKernel3
       run: |
