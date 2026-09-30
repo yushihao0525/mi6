@@ -55,30 +55,15 @@ jobs:
         echo "--- KSU 目录 ---"
         if [ -d KernelSU ]; then ls KernelSU; else ls drivers/kernelsu; fi
 
-    # 4.4 老内核缺部分 API，多源尝试拉取兼容补丁，失败不中断
-    - name: 4.4 API 兼容补丁（多源尝试）
+    # 关键：ReSukiSU 会检查 hook 完整性，缺 hook 直接中止编译
+    # 本步补上 fs/stat.c 的 newfstat 返回值 hook
+    - name: 注入 ReSukiSU manual hook
       if: env.ENABLE_KERNELSU == 'true'
       run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        export GIT_TERMINAL_PROMPT=0
-        echo "===== 尝试获取 NonGKI 补丁仓库 ====="
-        for U in \
-          "https://github.com/JackA1ltman/NonGKI_Kernel_Patches" \
-          "https://github.com/ShirkNeko/NonGKI_Kernel_Patches" ; do
-          rm -rf nongki
-          for B in mainline main master; do
-            if git clone -q --depth=1 -b "$B" "$U" nongki 2>/dev/null; then
-              echo "✅ 成功: $U ($B)"
-              break 2
-            fi
-          done
-        done
-        if [ -d nongki ]; then
-          echo "--- 可用补丁列表 ---"
-          find nongki -name "*.patch" | head -40
-        else
-          echo "⚠ 未获取到 NonGKI 补丁仓库，跳过"
-        fi
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/inject_ksu_hooks.py .
+        echo "--- 注入后校验 ---"
+        grep -n -A3 "SYSCALL_DEFINE2(newfstat," fs/stat.c | head -12
 
     - name: 应用自定义补丁
       if: env.ENABLE_CUSTOM_PATCHES == 'true'
@@ -102,10 +87,10 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
 
-        echo "===== ① 生成 defconfig ====="
+        echo "===== (1) 生成 defconfig ====="
         make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }} 2>&1 | tail -20
 
-        echo "===== ② 叠加 sagit 片段 ====="
+        echo "===== (2) 叠加 sagit 片段 ====="
         cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
 
         cat >> out/.config <<'EOF'
@@ -122,13 +107,13 @@ jobs:
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
         fi
 
-        echo "===== ③ olddefconfig ====="
+        echo "===== (3) olddefconfig ====="
         make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
 
-        echo "===== ④ 确认关键 config ====="
+        echo "===== (4) 确认关键 config ====="
         grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_CC_WERROR" out/.config
 
-        echo "===== ⑤ 正式编译 ====="
+        echo "===== (5) 正式编译 ====="
         make -j$(nproc --all) \
           CC="ccache clang" \
           O=out \
@@ -138,11 +123,12 @@ jobs:
           > build.log 2>&1
         echo "make 退出码: $?"
 
+        echo "===== ReSukiSU hook 检查结果 ====="
+        grep -E "ReSukiSU/manual_hook|You lost|manual_hook_check" build.log | head -20
+
         if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
           echo "########## 全部 error 行 ##########"
-          grep -nE "error:|error\[|Error [0-9]+|fatal error|undefined reference|No such file" build.log | head -40
-          echo "########## drivers/kernelsu 相关 ##########"
-          grep -nE "drivers/kernelsu" build.log | head -40
+          grep -nE "error:|Error [0-9]+|fatal error|undefined reference|No such file" build.log | head -40
           echo "########## 第一个 error 上下文 ##########"
           FIRST=$(grep -n "error:" build.log | head -1 | cut -d: -f1)
           if [ -n "$FIRST" ]; then
@@ -156,7 +142,6 @@ jobs:
         fi
         ls -lh out/arch/arm64/boot/Image.gz-dtb
 
-    # 编译失败也把完整日志传上来，方便定位（关键）
     - name: 上传编译日志（失败时）
       if: failure()
       uses: actions/upload-artifact@v4
