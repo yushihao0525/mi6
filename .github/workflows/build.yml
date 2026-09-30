@@ -14,7 +14,7 @@ jobs:
 
     # ── 1. 拉取本仓库（只含 build.yml / config.env / patches，很小）──
     - name: 拉取构建脚本仓库
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     # ── 2. 读取 config.env 中所有开关（注释行以 # 开头，不会被读走）──
     - name: 读取编译配置
@@ -128,7 +128,7 @@ jobs:
 
     # ── 13. ccache 缓存（二次构建大幅提速）──
     - name: 设置 ccache
-      uses: hendrikmuhs/ccache-action@v1.2
+      uses: hendrikmuhs/ccache-action@v1.2.11
       with:
         key: build-kernel-sagit-44-resukisu-susfs
         max-size: 2G
@@ -198,7 +198,7 @@ jobs:
 
     # ── 16. 上传刷机包 ──
     - name: 上传产物
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ env.KERNEL_ZIP_NAME }}
         path: kernel_workspace/AnyKernel3/*
