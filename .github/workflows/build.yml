@@ -137,7 +137,6 @@ jobs:
         patch -p1 --fuzz=5 --no-backup-if-mismatch \
           --exclude=kernel/sys.c \
           < "$P" || echo "⚠ 补丁部分冲突"
-
         REJ=$(find . -name "*.rej" 2>/dev/null || true)
         if [ -n "$REJ" ]; then
           echo "===== 冲突残留 .rej 内容 ====="
@@ -158,7 +157,6 @@ jobs:
         fi
         exit 0
 
-    # ★ 修复点：ls 在 set -e 下失败会直接终止 job → 全部加 || true
     - name: 应用 SUSFS 的 KSU 补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -171,13 +169,12 @@ jobs:
           exit 0
         fi
         cd "$KSU_DIR" || exit 0
-        # 两次 ls 都加 || true，避免 glob 无匹配时返回 2 触发 set -e
         PATCHES=$(ls ../../susfs/kernel_patches/KernelSU/*.patch ../../susfs/kernel_patches/KSU/*.patch 2>/dev/null || true)
         if [ -z "$PATCHES" ]; then
           PATCHES=$(ls ../../susfs/kernel_patches/10_enable_susfs_for_ksu.patch 2>/dev/null || true)
         fi
         if [ -z "$PATCHES" ]; then
-          echo "⚠ 无 KSU 侧补丁（susfs 仓库未带 KSU 目录），继续编译"
+          echo "⚠ 无 KSU 侧补丁，继续编译"
           exit 0
         fi
         for p in $PATCHES; do
@@ -185,6 +182,15 @@ jobs:
           echo "==> 打补丁 $p"
           patch -p1 --fuzz=5 < "$p" || echo "⚠ 冲突: $p"
         done
+        exit 0
+
+    # ★ 本次新增：断开 KSU_SUSFS 与 KSU_MANUAL_HOOK 的循环依赖
+    - name: 修复 KSU Kconfig 循环依赖
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        set +e
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
         exit 0
 
     - name: 探测 SUSFS 补丁覆盖范围
@@ -225,7 +231,6 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
-        # 提前创建，保证失败时也能上传
         touch build.log
 
         echo "===== (1) 生成 defconfig ====="
@@ -248,11 +253,8 @@ jobs:
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
         fi
 
-        # ── SUSFS 全功能开启（带安全探测）──
         if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
           echo "CONFIG_KSU_SUSFS=y" >> out/.config
-
-          # 不依赖补丁的核心功能：直接开
           if [ "${{ env.SUSFS_SUS_PATH }}" = "true" ]; then
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> out/.config; fi
           if [ "${{ env.SUSFS_SUS_MOUNT }}" = "true" ]; then
@@ -275,16 +277,12 @@ jobs:
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSTAT=y" >> out/.config; fi
           if [ "${{ env.SUSFS_ENABLE_LOG }}" = "true" ]; then
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> out/.config; fi
-
-          # 依赖补丁的功能：探测命中才开
           if [ "${{ env.SUSFS_SPOOF_STAT }}" = "true" ] && grep -qi "susfs" fs/stat.c; then
             echo "CONFIG_KSU_SUSFS_SPOOF_STAT=y" >> out/.config
             echo "  ✓ SPOOF_STAT 已开启"; else echo "  · SPOOF_STAT 跳过"; fi
-
           if [ "${{ env.SUSFS_SPOOF_UNAME }}" = "true" ] && grep -qi "susfs" kernel/sys.c; then
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
             echo "  ✓ SPOOF_UNAME 已开启"; else echo "  · SPOOF_UNAME 跳过"; fi
-
           if [ "${{ env.SUSFS_HIDE_SYMBOLS }}" = "true" ] && grep -qi "susfs" kernel/kallsyms.c; then
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
             echo "  ✓ HIDE_SYMBOLS 已开启"; else echo "  · HIDE_SYMBOLS 跳过"; fi
@@ -297,10 +295,22 @@ jobs:
         echo "===== (3) olddefconfig ====="
         make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
 
-        echo "===== (4) 确认生效的配置 ====="
+        # ★ 兜底：MANUAL_HOOK 若被 kconfig 丢弃，会退回 inline hook 模式
+        #   （需要一堆我们没注入的 hook），此时直接关掉 SUSFS 保底
+        echo "===== (4) 校验 hook 模式 ====="
+        if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+          echo "⚠ CONFIG_KSU_MANUAL_HOOK 丢失，关闭 SUSFS 兜底"
+          sed -i '/^CONFIG_KSU_SUSFS/d' out/.config
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+          make O=out ARCH=arm64 olddefconfig 2>&1 | tail -10
+        else
+          echo "✅ MANUAL_HOOK 已保留"
+        fi
+
+        echo "===== (5) 确认生效的配置 ====="
         grep -E "CONFIG_KSU" out/.config || echo "(无)"
 
-        echo "===== (5) 正式编译 ====="
+        echo "===== (6) 正式编译 ====="
         make -j$(nproc --all) \
           CC="ccache clang" \
           O=out \
@@ -311,7 +321,7 @@ jobs:
         echo "make 退出码: $?"
 
         echo "===== ReSukiSU hook 检查结果 ====="
-        grep -E "ReSukiSU/manual_hook|You lost|manual_hook_check" build.log | head -20 || true
+        grep -E "ReSukiSU|You lost|manual_hook|inline_hook" build.log | head -30 || true
 
         if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
           echo "########## 全部 error 行 ##########"
@@ -341,18 +351,14 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone -q --depth=1 https://github.com/osm0sis/AnyKernel3
-
-        # ★ AnyKernel3 变量名是大写，大小写都替换
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
         sed -i 's/DO.DEVICECHECK=1/DO.DEVICECHECK=0/g' AnyKernel3/anykernel.sh
         sed -i 's!^IS_SLOT_DEVICE=.*!IS_SLOT_DEVICE=0;!g' AnyKernel3/anykernel.sh
         sed -i 's!^is_slot_device=.*!is_slot_device=0;!g' AnyKernel3/anykernel.sh
         sed -i 's!^BLOCK=.*!BLOCK=auto;!g' AnyKernel3/anykernel.sh
         sed -i 's!^block=.*!block=auto;!g' AnyKernel3/anykernel.sh
-
         echo "===== 打包前确认关键行 ====="
         grep -nE "^(BLOCK|block|IS_SLOT_DEVICE|is_slot_device|do.devicecheck|DO.DEVICECHECK)" AnyKernel3/anykernel.sh || true
-
         cp android-kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
         rm -rf AnyKernel3/.git* AnyKernel3/README.md \
                AnyKernel3/ramdisk AnyKernel3/modules AnyKernel3/patch
