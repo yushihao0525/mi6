@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    name: Build sagit (ReSukiSU)
+    name: Build sagit (ReSukiSU + SUSFS)
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
 
@@ -16,7 +16,7 @@ jobs:
 
     - name: 读取编译配置
       run: |
-        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV
+        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|SUSFS_|EXTRA_CONFIG|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV
 
     - name: 安装编译依赖
       run: |
@@ -55,15 +55,146 @@ jobs:
         echo "--- KSU 目录 ---"
         if [ -d KernelSU ]; then ls KernelSU; else ls drivers/kernelsu; fi
 
-    # 关键：ReSukiSU 会检查 hook 完整性，缺 hook 直接中止编译
-    # 本步补上 fs/stat.c 的 newfstat 返回值 hook
     - name: 注入 ReSukiSU manual hook
       if: env.ENABLE_KERNELSU == 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         python3 ${{ github.workspace }}/scripts/inject_ksu_hooks.py .
-        echo "--- 注入后校验 ---"
-        grep -n -A3 "SYSCALL_DEFINE2(newfstat," fs/stat.c | head -12
+
+    - name: 下载 SUSFS（多源回退）
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        export GIT_TERMINAL_PROMPT=0
+        BR="${{ env.SUSFS_BRANCH }}"
+        OK=0
+        for URL in \
+          "https://github.com/ShirkNeko/susfs4ksu" \
+          "https://github.com/yougotme101/susfs4ksu" \
+          "https://gitlab.com/simonpunk/susfs4ksu" \
+          "https://github.com/Castorice4/susfs4ksu" ; do
+          rm -rf susfs
+          echo "==> 尝试 $URL (分支 $BR)"
+          if git clone -q --depth=1 -b "$BR" "$URL" susfs 2>/dev/null \
+             && [ -d susfs/kernel_patches ]; then
+            echo "✅ SUSFS 拉取成功: $URL"
+            OK=1
+            break
+          fi
+        done
+        if [ "$OK" != "1" ]; then
+          rm -rf susfs
+          echo "⚠ 所有 SUSFS 源均失败，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+        else
+          echo "--- kernel_patches 列表 ---"
+          ls susfs/kernel_patches/
+        fi
+
+    - name: 注入 SUSFS 文件
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        K=android-kernel
+        SRC=""; HDR=""
+        for D in susfs/kernel_patches/fs susfs/fs; do
+          [ -f "$D/susfs.c" ] && SRC="$D" && break
+        done
+        for H in susfs/kernel_patches/include/linux susfs/include/linux; do
+          [ -f "$H/susfs.h" ] && HDR="$H" && break
+        done
+        if [ -z "$SRC" ] || [ -z "$HDR" ]; then
+          echo "⚠ susfs 源文件缺失，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+          exit 0
+        fi
+        cp "$SRC/susfs.c"            $K/fs/susfs.c
+        cp "$HDR/susfs.h"            $K/include/linux/susfs.h
+        [ -f "$HDR/susfs_def.h" ] && cp "$HDR/susfs_def.h" $K/include/linux/susfs_def.h
+        grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
+        echo "✅ SUSFS 文件已注入"
+
+    # 跳过 kernel/sys.c（本机该文件被魔改，uname 补丁必冲突）
+    # 其余文件全打，冲突的 .rej 会打印出来
+    - name: 应用 SUSFS 内核补丁
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        P=""
+        for f in \
+          ../susfs/kernel_patches/50_add_susfs_in_kernel-4.9*.patch \
+          ../susfs/kernel_patches/50_add_susfs_in_kernel-4.4*.patch \
+          ../susfs/kernel_patches/50_add_susfs_in_kernel*.patch \
+          ../susfs/kernel_patches/*add_susfs*.patch ; do
+          [ -f "$f" ] && P="$f" && break
+        done
+        if [ -z "$P" ]; then
+          echo "⚠ 未找到 SUSFS 内核补丁，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+          exit 0
+        fi
+        echo "==> 使用补丁: $P"
+        patch -p1 --fuzz=5 --no-backup-if-mismatch \
+          --exclude=kernel/sys.c \
+          < "$P" || echo "⚠ 补丁部分冲突"
+
+        REJ=$(find . -name "*.rej" 2>/dev/null)
+        if [ -n "$REJ" ]; then
+          echo "===== 冲突残留 .rej 内容 ====="
+          for r in $REJ; do
+            echo "----------- $r -----------"
+            cat "$r"
+          done
+          if echo "$REJ" | grep -qi "kallsyms"; then
+            echo "⚠ kallsyms.c 冲突（关键文件），降级为仅 ReSukiSU"
+          else
+            echo "⚠ 仅非关键文件冲突，继续编译"
+          fi
+          find . -name "*.rej" -delete
+          find . -name "*.orig" -delete
+        else
+          echo "✅ 内核补丁无冲突"
+        fi
+
+    - name: 应用 SUSFS 的 KSU 补丁
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
+        if [ ! -d "$KSU_DIR" ]; then
+          echo "⚠ 未找到 $KSU_DIR，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+          exit 0
+        fi
+        cd "$KSU_DIR" || exit 0
+        PATCHES=$(ls ../../susfs/kernel_patches/KernelSU/*.patch ../../susfs/kernel_patches/KSU/*.patch 2>/dev/null)
+        if [ -z "$PATCHES" ]; then
+          PATCHES=$(ls ../../susfs/kernel_patches/10_enable_susfs_for_ksu.patch 2>/dev/null)
+        fi
+        if [ -z "$PATCHES" ]; then
+          echo "⚠ 无 KSU 侧补丁，降级为仅 ReSukiSU"
+          echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
+          exit 0
+        fi
+        for p in $PATCHES; do
+          [ -f "$p" ] || continue
+          echo "==> 打补丁 $p"
+          patch -p1 --fuzz=5 < "$p" || echo "⚠ 冲突: $p"
+        done
+
+    # 探测哪些文件真正含 susfs 代码，只有打进补丁的功能才开
+    - name: 探测 SUSFS 补丁覆盖范围
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        echo "===== 各文件 susfs 补丁命中情况 ====="
+        for f in kernel/sys.c kernel/kallsyms.c fs/stat.c fs/open.c fs/read_write.c fs/namei.c fs/exec.c; do
+          if [ -f "$f" ] && grep -qi "susfs" "$f"; then
+            echo "  [命中] $f"
+          else
+            echo "  [未中] $f"
+          fi
+        done
 
     - name: 应用自定义补丁
       if: env.ENABLE_CUSTOM_PATCHES == 'true'
@@ -78,7 +209,7 @@ jobs:
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2.11
       with:
-        key: build-kernel-sagit-44-resukisu
+        key: build-kernel-sagit-44-resukisu-susfs
         max-size: 2G
 
     - name: 编译内核
@@ -107,11 +238,69 @@ jobs:
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
         fi
 
+        # ── SUSFS 全功能开启（带安全探测）──
+        if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
+          echo "CONFIG_KSU_SUSFS=y" >> out/.config
+
+          # 不依赖补丁的核心功能：直接开
+          [ "${{ env.SUSFS_SUS_PATH }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> out/.config
+          [ "${{ env.SUSFS_SUS_MOUNT }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> out/.config
+          [ "${{ env.SUSFS_SUS_KSTAT }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> out/.config
+          [ "${{ env.SUSFS_TRY_UMOUNT }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> out/.config
+          [ "${{ env.SUSFS_OPEN_REDIRECT }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> out/.config
+          [ "${{ env.SUSFS_SUS_SU }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> out/.config
+          [ "${{ env.SUSFS_SUS_OVERLAYFS }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> out/.config
+          [ "${{ env.SUSFS_SPOOF_CMDLINE }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> out/.config
+          [ "${{ env.SUSFS_AUTO_ADD_BIND_MOUNT }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> out/.config
+          [ "${{ env.SUSFS_AUTO_ADD_KSTAT }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSTAT=y" >> out/.config
+          [ "${{ env.SUSFS_ENABLE_LOG }}" = "true" ] && \
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> out/.config
+
+          # 依赖 fs/stat.c 补丁：探测命中才开
+          if [ "${{ env.SUSFS_SPOOF_STAT }}" = "true" ] && grep -qi "susfs" fs/stat.c; then
+            echo "CONFIG_KSU_SUSFS_SPOOF_STAT=y" >> out/.config
+            echo "  ✓ SPOOF_STAT 已开启（stat.c 补丁命中）"
+          else
+            echo "  · SPOOF_STAT 跳过（stat.c 补丁未命中）"
+          fi
+
+          # 依赖 kernel/sys.c 补丁：默认关闭，探测命中才开
+          if [ "${{ env.SUSFS_SPOOF_UNAME }}" = "true" ] && grep -qi "susfs" kernel/sys.c; then
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
+            echo "  ✓ SPOOF_UNAME 已开启（sys.c 补丁命中）"
+          else
+            echo "  · SPOOF_UNAME 跳过（sys.c 补丁未命中，本机已有 fake_comm 替代）"
+          fi
+
+          # 依赖 kernel/kallsyms.c 补丁：探测命中才开
+          if [ "${{ env.SUSFS_HIDE_SYMBOLS }}" = "true" ] && grep -qi "susfs" kernel/kallsyms.c; then
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
+            echo "  ✓ HIDE_KSU_SUSFS_SYMBOLS 已开启（kallsyms.c 补丁命中）"
+          else
+            echo "  · HIDE_KSU_SUSFS_SYMBOLS 跳过（kallsyms.c 补丁未命中）"
+          fi
+        fi
+
+        # 额外自定义 config
+        if [ -n "${{ env.EXTRA_CONFIG }}" ]; then
+          echo "${{ env.EXTRA_CONFIG }}" >> out/.config
+        fi
+
         echo "===== (3) olddefconfig ====="
         make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
 
-        echo "===== (4) 确认关键 config ====="
-        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_CC_WERROR" out/.config
+        echo "===== (4) 确认生效的 SUSFS/KSU 配置 ====="
+        grep -E "CONFIG_KSU" out/.config || echo "(无)"
 
         echo "===== (5) 正式编译 ====="
         make -j$(nproc --all) \
@@ -153,9 +342,18 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone -q --depth=1 https://github.com/osm0sis/AnyKernel3
+
+        # ★ AnyKernel3 变量名是大写，大小写都替换，双保险
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-        sed -i 's/is_slot_device=1/is_slot_device=0/g' AnyKernel3/anykernel.sh
-        sed -i 's!block=.*!block=/dev/block/bootdevice/by-name/boot;!g' AnyKernel3/anykernel.sh
+        sed -i 's/DO.DEVICECHECK=1/DO.DEVICECHECK=0/g' AnyKernel3/anykernel.sh
+        sed -i 's!^IS_SLOT_DEVICE=.*!IS_SLOT_DEVICE=0;!g' AnyKernel3/anykernel.sh
+        sed -i 's!^is_slot_device=.*!is_slot_device=0;!g' AnyKernel3/anykernel.sh
+        sed -i 's!^BLOCK=.*!BLOCK=auto;!g' AnyKernel3/anykernel.sh
+        sed -i 's!^block=.*!block=auto;!g' AnyKernel3/anykernel.sh
+
+        echo "===== 打包前确认关键行 ====="
+        grep -nE "^(BLOCK|block|IS_SLOT_DEVICE|is_slot_device|do.devicecheck|DO.DEVICECHECK)" AnyKernel3/anykernel.sh
+
         cp android-kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
         rm -rf AnyKernel3/.git* AnyKernel3/README.md \
                AnyKernel3/ramdisk AnyKernel3/modules AnyKernel3/patch
