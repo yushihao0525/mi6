@@ -94,7 +94,13 @@ jobs:
         git checkout -- . 2>/dev/null || true
         curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
         echo "--- KSU 目录 ---"
-        if [ -d KernelSU ]; then ls KernelSU; else ls drivers/kernelsu; fi
+        if [ -d KernelSU ]; then
+          KSU_DIR=KernelSU
+        else
+          KSU_DIR=drivers/kernelsu
+        fi
+        echo "$KSU_DIR" > $GITHUB_WORKSPACE/kernel_workspace/ksu_dir.txt
+        ls "$KSU_DIR"
 
     - name: 下载 SUSFS（多源回退）
       if: env.ENABLE_SUSFS == 'true'
@@ -125,6 +131,16 @@ jobs:
           ls susfs/kernel_patches/ || true
         fi
 
+    # ★ 打 SUSFS 补丁前先备份 KSU 目录，供编译失败时回滚
+    - name: 备份 KSU 目录
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        KSU_DIR=$(cat $GITHUB_WORKSPACE/kernel_workspace/ksu_dir.txt)
+        rm -rf $GITHUB_WORKSPACE/kernel_workspace/ksu_backup
+        cp -a "$KSU_DIR" $GITHUB_WORKSPACE/kernel_workspace/ksu_backup
+        echo "已备份 $KSU_DIR -> ksu_backup"
+
     - name: 注入 SUSFS 文件
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -148,8 +164,7 @@ jobs:
         grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
         echo "✅ SUSFS 文件已注入"
 
-    # ★ 顺序关键：SUSFS 补丁必须打在"未被 KSU hook 改动"的干净源码上
-    #   否则 include hunk 匹配失败 → 代码进去了但 include 丢了
+    # ★ 剔除 4.4 上必崩的文件段：sys.c / kallsyms.c / namei.c
     - name: 应用 SUSFS 内核补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -170,8 +185,9 @@ jobs:
         fi
         echo "==> 原补丁: $P"
         python3 ${{ github.workspace }}/scripts/strip_patch.py \
-          "$P" ../susfs_patch_stripped.patch kernel/sys.c kernel/kallsyms.c
-        echo "==> 剔除 sys.c / kallsyms.c 后应用补丁"
+          "$P" ../susfs_patch_stripped.patch \
+          kernel/sys.c kernel/kallsyms.c fs/namei.c
+        echo "==> 剔除 sys.c / kallsyms.c / namei.c 后应用补丁"
         patch -p1 --fuzz=5 --no-backup-if-mismatch \
           < ../susfs_patch_stripped.patch || echo "⚠ 补丁部分冲突"
         REJ=$(find . -name "*.rej" 2>/dev/null || true)
@@ -194,7 +210,7 @@ jobs:
       run: |
         set +e
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
+        KSU_DIR=$(cat $GITHUB_WORKSPACE/kernel_workspace/ksu_dir.txt)
         if [ ! -d "$KSU_DIR" ]; then
           echo "⚠ 未找到 $KSU_DIR，降级"
           echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
@@ -224,7 +240,6 @@ jobs:
         python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
         exit 0
 
-    # ★ 移到 SUSFS 补丁之后
     - name: 注入 ReSukiSU manual hook
       if: env.ENABLE_KERNELSU == 'true'
       run: |
@@ -239,7 +254,6 @@ jobs:
         python3 ${{ github.workspace }}/scripts/repair_ksu_hooks.py .
         exit 0
 
-    # ★ 兜底：补齐 susfs.h 的 include
     - name: 补齐 susfs.h 引用
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -287,7 +301,7 @@ jobs:
         key: build-kernel-sagit-44-resukisu-susfs-clang12
         max-size: 2G
 
-    - name: 编译内核
+    - name: 编译内核（SUSFS 失败自动回滚重编）
       id: build
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
@@ -298,11 +312,13 @@ jobs:
         clang --version
         touch build.log
 
-        echo "===== (1) defconfig ====="
-        make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }} 2>&1 | tail -20
-        echo "===== (2) 叠加片段 ====="
-        cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
-        cat >> out/.config <<'EOF'
+        gen_config() {
+          echo "===== 生成 defconfig ====="
+          rm -f out/.config
+          make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }} 2>&1 | tail -20
+          echo "===== 叠加 sagit 片段 ====="
+          cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
+          cat >> out/.config <<'EOF'
         CONFIG_LOCALVERSION="-ReSukiSU"
         # CONFIG_CC_WERROR is not set
         CONFIG_KALLSYMS=y
@@ -310,91 +326,124 @@ jobs:
         CONFIG_KPROBES=y
         CONFIG_KPROBE_EVENTS=y
         EOF
-        if [ "${{ env.ENABLE_KERNELSU }}" = "true" ]; then
-          echo "CONFIG_KSU=y" >> out/.config
-          echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-        fi
-        if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
-          echo "CONFIG_KSU_SUSFS=y" >> out/.config
-          if [ "${{ env.SUSFS_SUS_PATH }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_SUS_MOUNT }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_SUS_KSTAT }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_TRY_UMOUNT }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_OPEN_REDIRECT }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_SUS_SU }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_SUS_OVERLAYFS }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_SPOOF_CMDLINE }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_AUTO_ADD_BIND_MOUNT }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_AUTO_ADD_KSTAT }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSTAT=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_ENABLE_LOG }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> out/.config; fi
-          if [ "${{ env.SUSFS_SPOOF_STAT }}" = "true" ] && grep -qi "susfs" fs/stat.c; then
-            echo "CONFIG_KSU_SUSFS_SPOOF_STAT=y" >> out/.config
-            echo "  ✓ SPOOF_STAT"; else echo "  · SPOOF_STAT 跳过"; fi
-          if [ "${{ env.SUSFS_SPOOF_UNAME }}" = "true" ] && grep -qi "susfs" kernel/sys.c; then
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
-            echo "  ✓ SPOOF_UNAME"; else echo "  · SPOOF_UNAME 跳过"; fi
-          if [ "${{ env.SUSFS_HIDE_SYMBOLS }}" = "true" ] && grep -qi "susfs" kernel/kallsyms.c; then
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
-            echo "  ✓ HIDE_SYMBOLS"; else echo "  · HIDE_SYMBOLS 跳过"; fi
-        fi
-        if [ -n "${{ env.EXTRA_CONFIG }}" ]; then
-          echo "${{ env.EXTRA_CONFIG }}" >> out/.config
-        fi
+          if [ "${{ env.ENABLE_KERNELSU }}" = "true" ]; then
+            echo "CONFIG_KSU=y" >> out/.config
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+          fi
+          if [ "$1" = "susfs" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> out/.config
+            if [ "${{ env.SUSFS_SUS_PATH }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_SUS_MOUNT }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_SUS_KSTAT }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_TRY_UMOUNT }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_OPEN_REDIRECT }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_SUS_SU }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_SUS_OVERLAYFS }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_SPOOF_CMDLINE }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_AUTO_ADD_BIND_MOUNT }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_AUTO_ADD_KSTAT }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSTAT=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_ENABLE_LOG }}" = "true" ]; then
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> out/.config; fi
+            if [ "${{ env.SUSFS_SPOOF_STAT }}" = "true" ] && grep -qi "susfs" fs/stat.c; then
+              echo "CONFIG_KSU_SUSFS_SPOOF_STAT=y" >> out/.config
+              echo "  ✓ SPOOF_STAT"; else echo "  · SPOOF_STAT 跳过"; fi
+            if [ "${{ env.SUSFS_SPOOF_UNAME }}" = "true" ] && grep -qi "susfs" kernel/sys.c; then
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
+              echo "  ✓ SPOOF_UNAME"; else echo "  · SPOOF_UNAME 跳过"; fi
+            if [ "${{ env.SUSFS_HIDE_SYMBOLS }}" = "true" ] && grep -qi "susfs" kernel/kallsyms.c; then
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
+              echo "  ✓ HIDE_SYMBOLS"; else echo "  · HIDE_SYMBOLS 跳过"; fi
+          else
+            echo "  (不带 SUSFS)"
+          fi
+          if [ -n "${{ env.EXTRA_CONFIG }}" ]; then
+            echo "${{ env.EXTRA_CONFIG }}" >> out/.config
+          fi
+          echo "===== olddefconfig ====="
+          make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
+          echo "===== 校验 hook 模式 ====="
+          if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+            echo "⚠ MANUAL_HOOK 丢失"
+            sed -i '/^CONFIG_KSU_SUSFS/d' out/.config
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+            make O=out ARCH=arm64 olddefconfig 2>&1 | tail -10
+          else
+            echo "✅ MANUAL_HOOK 已保留"
+          fi
+          echo "===== 生效配置 ====="
+          grep -E "CONFIG_KSU" out/.config || echo "(无)"
+        }
 
-        echo "===== (3) olddefconfig ====="
-        make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
+        run_make() {
+          echo "===== 正式编译 ====="
+          make -j$(nproc --all) \
+            CC="ccache clang" \
+            O=out \
+            ARCH=arm64 \
+            KCFLAGS="-fcommon" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            > build.log 2>&1
+          echo "make 退出码: $?"
+          echo "===== ReSukiSU hook 检查 ====="
+          grep -E "ReSukiSU|You lost|manual_hook|inline_hook" build.log | head -30 || true
+        }
 
-        echo "===== (4) 校验 hook 模式 ====="
-        if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-          echo "⚠ MANUAL_HOOK 丢失，关闭 SUSFS 兜底"
-          sed -i '/^CONFIG_KSU_SUSFS/d' out/.config
-          echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-          make O=out ARCH=arm64 olddefconfig 2>&1 | tail -10
-        else
-          echo "✅ MANUAL_HOOK 已保留"
-        fi
-
-        echo "===== (5) 生效配置 ====="
-        grep -E "CONFIG_KSU" out/.config || echo "(无)"
-
-        echo "===== (6) 编译 ====="
-        make -j$(nproc --all) \
-          CC="ccache clang" \
-          O=out \
-          ARCH=arm64 \
-          KCFLAGS="-fcommon" \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-          > build.log 2>&1
-        echo "make 退出码: $?"
-
-        echo "===== ReSukiSU hook 检查 ====="
-        grep -E "ReSukiSU|You lost|manual_hook|inline_hook" build.log | head -30 || true
-
-        if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
+        dump_err() {
           echo "########## error 行 ##########"
           grep -nE "error:|Error [0-9]+|fatal error|undefined reference|multiple definition" build.log | head -40 || true
           FIRST=$(grep -n "error:" build.log | head -1 | cut -d: -f1 || true)
           if [ -n "$FIRST" ]; then
             S=$((FIRST>20 ? FIRST-20 : 1))
+            echo "########## 第一个 error 上下文 ##########"
             sed -n "${S},$((FIRST+20))p" build.log
           fi
           echo "########## 末尾 60 行 ##########"
           tail -60 build.log
+        }
+
+        # ── 第一次：带 SUSFS ──
+        if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
+          gen_config susfs
+        else
+          gen_config nosusfs
+        fi
+        run_make
+
+        # ── 失败则回滚 SUSFS 重编 ──
+        if [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
+          echo "=============================================="
+          echo " 带 SUSFS 编译失败 → 回滚全部 SUSFS 改动后重编"
+          echo "=============================================="
+          dump_err
+          KSU_DIR=$(cat $GITHUB_WORKSPACE/kernel_workspace/ksu_dir.txt)
+          git checkout -- . 2>/dev/null || true
+          rm -f fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+          rm -rf KernelSU drivers/kernelsu
+          cp -a $GITHUB_WORKSPACE/kernel_workspace/ksu_backup "$KSU_DIR"
+          echo "已回滚 SUSFS，恢复 KSU 目录: $KSU_DIR"
+          python3 ${{ github.workspace }}/scripts/inject_ksu_hooks.py .
+          python3 ${{ github.workspace }}/scripts/repair_ksu_hooks.py . || true
+          gen_config nosusfs
+          run_make
+        fi
+
+        if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
+          dump_err
           echo "::error::编译失败"
           exit 1
         fi
+        echo "===== 产物 ====="
         ls -lh out/arch/arm64/boot/Image.gz-dtb
 
     - name: 上传编译日志（失败时）
