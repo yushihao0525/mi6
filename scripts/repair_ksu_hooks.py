@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """保守修复 fs/exec.c 与 fs/open.c 的 KSU hook
 
-原则（吸取上版教训）:
+原则:
   ★ 文件中只要出现 hook 函数名（哪怕只是 extern 声明）就一律跳过
-    —— ReSukiSU 的 check 认声明也算 found，贸然改写会把代码改坏
   ★ 只有完全找不到函数名时才注入，且用行级精确定位
 
 覆盖:
@@ -31,20 +30,13 @@ def wr(p, s):
 
 
 def find_def_line(lines, needle):
-    """返回包含 needle 的定义行下标"""
     for i, ln in enumerate(lines):
         if needle in ln:
             return i
     return -1
 
 
-def insert_decl_before_line(lines, idx, decl):
-    lines.insert(idx, decl)
-    return lines
-
-
 def find_body_brace(lines, start):
-    """从 start 行起找函数体起始 '{' 所在行"""
     for i in range(start, len(lines)):
         if '{' in lines[i]:
             return i
@@ -65,7 +57,6 @@ def find_body_end(lines, brace_line):
 
 
 def insert_call(lines, brace_line, end_line, call):
-    """跳过变量声明区，在第一个语句前插入"""
     pos = None
     for i in range(brace_line + 1, end_line):
         t = lines[i].strip()
@@ -120,7 +111,6 @@ for t in TASKS:
         continue
 
     s = rd(p)
-    # ★ 保守：出现函数名就跳过
     if t['symbol'] in s:
         print('  已存在 %s，不改动' % t['symbol'])
         continue
@@ -131,8 +121,7 @@ for t in TASKS:
         print('  未找到 %s，跳过' % t['needle'])
         continue
 
-    lines = insert_decl_before_line(lines, idx, t['decl'])
-    # 插入后行号后移 1+n
+    lines.insert(idx, t['decl'])
     idx2 = find_def_line(lines, t['needle'])
     bl = find_body_brace(lines, idx2)
     if bl < 0:
