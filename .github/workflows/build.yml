@@ -154,7 +154,7 @@ jobs:
         grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
         echo "✅ SUSFS 文件已注入"
 
-    # ★ 用 strip_patch.py 剔除 kernel/sys.c 段，替代 patch 不支持的 --exclude
+    # 剔除 sys.c / kallsyms.c（4.4 上必冲突），其余全打，冲突只清理不降级
     - name: 应用 SUSFS 内核补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -175,20 +175,18 @@ jobs:
         fi
         echo "==> 原补丁: $P"
         python3 ${{ github.workspace }}/scripts/strip_patch.py \
-          "$P" ../susfs_patch_stripped.patch kernel/sys.c
-        echo "==> 剔除 sys.c 后应用补丁"
+          "$P" ../susfs_patch_stripped.patch kernel/sys.c kernel/kallsyms.c
+        echo "==> 剔除 sys.c / kallsyms.c 后应用补丁"
         patch -p1 --fuzz=5 --no-backup-if-mismatch \
           < ../susfs_patch_stripped.patch || echo "⚠ 补丁部分冲突"
         REJ=$(find . -name "*.rej" 2>/dev/null || true)
         if [ -n "$REJ" ]; then
           echo "===== 冲突残留 ====="
-          for r in $REJ; do echo "--- $r ---"; cat "$r" || true; done
-          if echo "$REJ" | grep -qi "kallsyms"; then
-            echo "⚠ kallsyms.c 冲突，降级为仅 ReSukiSU"
-            echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
-          else
-            echo "⚠ 非关键冲突，继续"
-          fi
+          for r in $REJ; do
+            echo "----------- $r -----------"
+            cat "$r" || true
+          done
+          echo "⚠ 清理残留后继续编译"
           find . -name "*.rej" -delete 2>/dev/null || true
           find . -name "*.orig" -delete 2>/dev/null || true
         else
@@ -231,13 +229,20 @@ jobs:
         python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
         exit 0
 
-    # ★ 保守修复：只有 hook 完全缺失才动手，绝不再误改
     - name: 修复 KSU hook（exec / open）
       if: env.ENABLE_KERNELSU == 'true'
       run: |
         set +e
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         python3 ${{ github.workspace }}/scripts/repair_ksu_hooks.py .
+        exit 0
+
+    # ★ 新增：诊断 mnt_id 重复定义来源
+    - name: 诊断 mnt_id 重复定义
+      run: |
+        set +e
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/diag_mnt_id.py . 2>&1 | head -40
         exit 0
 
     - name: 探测 SUSFS 补丁覆盖范围
@@ -267,7 +272,7 @@ jobs:
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2.11
       with:
-        key: build-kernel-sagit-44-resukisu-susfs
+        key: build-kernel-sagit-44-resukisu-susfs-fcommon
         max-size: 2G
 
     - name: 编译内核
@@ -351,9 +356,12 @@ jobs:
         echo "===== (5) 生效配置 ====="
         grep -E "CONFIG_KSU" out/.config || echo "(无)"
 
-        echo "===== (6) 编译 ====="
+        echo "===== (6) 编译（KCFLAGS=-fcommon 修复 mnt_id 重复定义）====="
         make -j$(nproc --all) \
-          CC="ccache clang" O=out ARCH=arm64 \
+          CC="ccache clang" \
+          O=out \
+          ARCH=arm64 \
+          KCFLAGS="-fcommon" \
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
           > build.log 2>&1
@@ -364,7 +372,7 @@ jobs:
 
         if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
           echo "########## error 行 ##########"
-          grep -nE "error:|Error [0-9]+|fatal error|undefined reference" build.log | head -40 || true
+          grep -nE "error:|Error [0-9]+|fatal error|undefined reference|multiple definition" build.log | head -40 || true
           FIRST=$(grep -n "error:" build.log | head -1 | cut -d: -f1 || true)
           if [ -n "$FIRST" ]; then
             S=$((FIRST>20 ? FIRST-20 : 1))
