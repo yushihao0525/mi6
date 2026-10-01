@@ -16,7 +16,7 @@ jobs:
 
     - name: 读取编译配置
       run: |
-        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|SUSFS_|EXTRA_CONFIG|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV || true
+        grep -E '^(KERNEL_SOURCE|KERNEL_SOURCE_BRANCH|KERNEL_DEFCONFIG|KERNEL_FRAGMENT|KERNEL_ZIP_NAME|CLANG_BRANCH|CLANG_DIR|ENABLE_KERNELSU|ENABLE_SUSFS|SUSFS_BRANCH|SUSFS_|EXTRA_CONFIG|ENABLE_CUSTOM_PATCHES)=' config.env >> $GITHUB_ENV || true
 
     - name: 安装编译依赖
       run: |
@@ -30,13 +30,40 @@ jobs:
         sudo ln -sf /usr/bin/python3 /usr/bin/python || true
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
-    - name: 下载 clang 12.0.5
+    # ★ sparse checkout：只拉 CLANG_DIR 一个目录，跳过同分支下其他 clang 版本
+    # ★ timeout 900：15 分钟拉不完就失败，不再无限等
+    - name: 下载 clang (${{ env.CLANG_BRANCH }} / ${{ env.CLANG_DIR }})
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone -q --depth=1 --single-branch \
+        rm -rf clang-aosp
+        set +e
+        echo "==> 方式一：sparse checkout（推荐，体积小）"
+        timeout 900 git clone -q --depth=1 --single-branch \
+          --filter=blob:none --sparse \
           https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-          -b android12-release clang-aosp
-        ls clang-aosp/clang-r416183b/bin/clang
+          -b ${{ env.CLANG_BRANCH }} clang-aosp
+        RC=$?
+        if [ "$RC" = "0" ] && [ -d clang-aosp ]; then
+          cd clang-aosp
+          git sparse-checkout set ${{ env.CLANG_DIR }}
+          cd ..
+        fi
+        if [ ! -f clang-aosp/${{ env.CLANG_DIR }}/bin/clang ]; then
+          echo "⚠ sparse 方式失败(退出码 $RC)，回退全量 clone"
+          rm -rf clang-aosp
+          timeout 1500 git clone -q --depth=1 --single-branch \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            -b ${{ env.CLANG_BRANCH }} clang-aosp
+        fi
+        set -e
+        # 校验必须有可执行文件
+        if [ ! -f clang-aosp/${{ env.CLANG_DIR }}/bin/clang ]; then
+          echo "::error::clang 下载失败，未找到 clang-aosp/${{ env.CLANG_DIR }}/bin/clang"
+          ls -la clang-aosp/ || true
+          exit 1
+        fi
+        chmod +x clang-aosp/${{ env.CLANG_DIR }}/bin/clang
+        clang-aosp/${{ env.CLANG_DIR }}/bin/clang --version
 
     - name: 下载内核源码
       run: |
@@ -183,7 +210,6 @@ jobs:
         done
         exit 0
 
-    # ★ 修复 Kconfig 循环依赖（保住 MANUAL_HOOK）
     - name: 修复 KSU Kconfig 循环依赖
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -192,7 +218,6 @@ jobs:
         python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
         exit 0
 
-    # ★ 本次新增：SUSFS 补丁会破坏 fs/exec.c 的 execveat hook，强制重建
     - name: 修复 execveat hook
       if: env.ENABLE_KERNELSU == 'true'
       run: |
@@ -238,7 +263,9 @@ jobs:
       id: build
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/${{ env.CLANG_DIR }}/bin:$PATH
+        which clang
+        clang --version
         touch build.log
 
         echo "===== (1) 生成 defconfig ====="
