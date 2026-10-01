@@ -8,13 +8,9 @@
   symbol KSU_MANUAL_HOOK is part of choice <choice>
   -> recursive dependency detected (error)
 
-根因: SUSFS 补丁把 KSU_SUSFS 塞进 hook 模式 choice 组，
-      又加 depends on KSU_MANUAL_HOOK（同组），形成循环。
-
 修法:
   1. 删除 KSU_SUSFS 块内 depends on KSU_MANUAL_HOOK 与 default 行
   2. 若 KSU_SUSFS 位于 choice...endchoice 之间，把整块移到 endchoice 之后
-  3. 打印修复后块内容 + 残留检查，便于验证
 """
 import os, sys
 
@@ -86,7 +82,6 @@ if b is None:
 start, end = b
 cleaned, removed = clean_block(lines[start:end])
 
-# 判断 KSU_SUSFS 是否在 choice 组内
 last_choice = -1
 last_endchoice = -1
 for i in range(start):
@@ -126,7 +121,6 @@ else:
     print('   (块内无 depends on KSU_MANUAL_HOOK / default)')
 print('KSU_SUSFS 移出 choice 组: %s' % ('是' if moved else '否(原本就在组外)'))
 
-# 验证
 check = read_lines(path)
 b2 = find_block(check, 'KSU_SUSFS')
 print('===== 修复后 KSU_SUSFS 块 =====')
