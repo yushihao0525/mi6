@@ -30,40 +30,67 @@ jobs:
         sudo ln -sf /usr/bin/python3 /usr/bin/python || true
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
-    # ★ sparse checkout：只拉 CLANG_DIR 一个目录，跳过同分支下其他 clang 版本
-    # ★ timeout 900：15 分钟拉不完就失败，不再无限等
-    - name: 下载 clang (${{ env.CLANG_BRANCH }} / ${{ env.CLANG_DIR }})
+    # ★ 先轻量列出分支里真实的 clang-* 目录，再只拉那一个
+    - name: 下载 clang
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         rm -rf clang-aosp
         set +e
-        echo "==> 方式一：sparse checkout（推荐，体积小）"
-        timeout 900 git clone -q --depth=1 --single-branch \
-          --filter=blob:none --sparse \
-          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-          -b ${{ env.CLANG_BRANCH }} clang-aosp
-        RC=$?
-        if [ "$RC" = "0" ] && [ -d clang-aosp ]; then
+        URL=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+        BR="${{ env.CLANG_BRANCH }}"
+        WANT="${{ env.CLANG_DIR }}"
+
+        echo "==> ① 列出 $BR 分支下的 clang 目录（不下载内容）"
+        timeout 600 git clone -q --depth=1 --filter=blob:none --no-checkout \
+          --single-branch -b "$BR" "$URL" clang-aosp
+        DIRS=""
+        if [ -d clang-aosp/.git ]; then
           cd clang-aosp
-          git sparse-checkout set ${{ env.CLANG_DIR }}
+          DIRS=$(git ls-tree HEAD --name-only 2>/dev/null | grep '^clang-' || true)
           cd ..
         fi
-        if [ ! -f clang-aosp/${{ env.CLANG_DIR }}/bin/clang ]; then
-          echo "⚠ sparse 方式失败(退出码 $RC)，回退全量 clone"
-          rm -rf clang-aosp
-          timeout 1500 git clone -q --depth=1 --single-branch \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            -b ${{ env.CLANG_BRANCH }} clang-aosp
+        echo "$DIRS" | sed 's/^/    /'
+
+        TARGET="$WANT"
+        if [ -n "$DIRS" ]; then
+          if ! echo "$DIRS" | grep -qx "$TARGET"; then
+            echo "⚠ $TARGET 不在该分支，自动挑选"
+            TARGET=$(echo "$DIRS" | grep -E '^clang-r' | sort -V | tail -1)
+            [ -z "$TARGET" ] && TARGET=$(echo "$DIRS" | head -1)
+          fi
         fi
-        set -e
-        # 校验必须有可执行文件
-        if [ ! -f clang-aosp/${{ env.CLANG_DIR }}/bin/clang ]; then
-          echo "::error::clang 下载失败，未找到 clang-aosp/${{ env.CLANG_DIR }}/bin/clang"
-          ls -la clang-aosp/ || true
+        echo "==> 使用目录: $TARGET"
+
+        if [ -n "$TARGET" ] && [ -d clang-aosp/.git ]; then
+          cd clang-aosp
+          git sparse-checkout init --cone 2>/dev/null || git sparse-checkout init 2>/dev/null
+          git sparse-checkout set "$TARGET" 2>/dev/null
+          git checkout -q 2>/dev/null || git checkout 2>/dev/null
+          cd ..
+        fi
+
+        if [ ! -f "clang-aosp/$TARGET/bin/clang" ]; then
+          echo "⚠ sparse 失败，回退全量 clone（较慢）"
+          rm -rf clang-aosp
+          timeout 1500 git clone -q --depth=1 --single-branch -b "$BR" "$URL" clang-aosp
+          if [ ! -f "clang-aosp/$TARGET/bin/clang" ]; then
+            echo "==> 全量后重新探测实际目录"
+            FOUND=$(ls -d clang-aosp/clang-* 2>/dev/null | grep -E "$TARGET|clang-r" | head -1)
+            if [ -n "$FOUND" ]; then TARGET=$(basename "$FOUND"); fi
+          fi
+        fi
+
+        if [ ! -f "clang-aosp/$TARGET/bin/clang" ]; then
+          echo "::error::clang 下载失败: clang-aosp/$TARGET/bin/clang"
+          ls -la clang-aosp/ 2>/dev/null || true
           exit 1
         fi
-        chmod +x clang-aosp/${{ env.CLANG_DIR }}/bin/clang
-        clang-aosp/${{ env.CLANG_DIR }}/bin/clang --version
+
+        chmod +x "clang-aosp/$TARGET/bin/clang"
+        # 把目录名传给后续步骤
+        echo "$TARGET" > $GITHUB_WORKSPACE/kernel_workspace/clang_dir.txt
+        echo "==> clang 版本:"
+        "clang-aosp/$TARGET/bin/clang" --version
 
     - name: 下载内核源码
       run: |
@@ -226,6 +253,15 @@ jobs:
         python3 ${{ github.workspace }}/scripts/fix_exec_hook.py .
         exit 0
 
+    # ★ 本次新增：修复被 SUSFS 补丁破坏的 faccessat hook
+    - name: 修复 faccessat hook
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        set +e
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/fix_open_hook.py .
+        exit 0
+
     - name: 探测 SUSFS 补丁覆盖范围
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -263,7 +299,10 @@ jobs:
       id: build
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/${{ env.CLANG_DIR }}/bin:$PATH
+        # 从文件读取实际 clang 目录名（由下载步骤写入）
+        CLANG_DIR=$(cat $GITHUB_WORKSPACE/kernel_workspace/clang_dir.txt)
+        echo "使用 clang 目录: $CLANG_DIR"
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/$CLANG_DIR/bin:$PATH
         which clang
         clang --version
         touch build.log
