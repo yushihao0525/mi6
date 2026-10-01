@@ -3,9 +3,9 @@
 """从 unified diff 补丁中剔除指定文件的段落（替代 GNU patch 不支持的 --exclude）
 
 用法: strip_patch.py <输入补丁> <输出补丁> [要排除的文件...]
-例:   strip_patch.py in.patch out.patch kernel/sys.c
+例:   strip_patch.py in.patch out.patch kernel/sys.c kernel/kallsyms.c
 """
-import sys, os, re
+import sys, re
 
 if len(sys.argv) < 3:
     print('用法: strip_patch.py <in> <out> [exclude...]')
@@ -17,9 +17,10 @@ excludes = sys.argv[3:]
 with open(inp, 'r', encoding='utf-8', errors='replace') as f:
     lines = f.read().split('\n')
 
-blocks = []      # [(filekey, [lines])]
-cur = None       # {'key':..., 'buf':[...]}
+blocks = []
+cur = None
 preamble = []
+
 
 def path_of(txt):
     m = re.match(r'^diff --git a/(.*?) b/(.*?)$', txt.strip())
@@ -32,6 +33,7 @@ def path_of(txt):
     if m:
         return m.group(1)
     return None
+
 
 for ln in lines:
     t = ln.strip()
@@ -52,8 +54,7 @@ if cur:
 
 kept, dropped = [], []
 for b in blocks:
-    hit = any(ex in b['key'] for ex in excludes)
-    if hit:
+    if any(ex in b['key'] for ex in excludes):
         dropped.append(b['key'])
     else:
         kept.append(b)
