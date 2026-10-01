@@ -114,7 +114,6 @@ jobs:
         grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
         echo "✅ SUSFS 文件已注入"
 
-    # 跳过 kernel/sys.c（本机该文件被魔改，uname 补丁必冲突）
     - name: 应用 SUSFS 内核补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -184,13 +183,22 @@ jobs:
         done
         exit 0
 
-    # ★ 本次新增：断开 KSU_SUSFS 与 KSU_MANUAL_HOOK 的循环依赖
+    # ★ 修复 Kconfig 循环依赖（保住 MANUAL_HOOK）
     - name: 修复 KSU Kconfig 循环依赖
       if: env.ENABLE_SUSFS == 'true'
       run: |
         set +e
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
+        exit 0
+
+    # ★ 本次新增：SUSFS 补丁会破坏 fs/exec.c 的 execveat hook，强制重建
+    - name: 修复 execveat hook
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        set +e
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/fix_exec_hook.py .
         exit 0
 
     - name: 探测 SUSFS 补丁覆盖范围
@@ -295,8 +303,6 @@ jobs:
         echo "===== (3) olddefconfig ====="
         make O=out ARCH=arm64 olddefconfig 2>&1 | tail -20
 
-        # ★ 兜底：MANUAL_HOOK 若被 kconfig 丢弃，会退回 inline hook 模式
-        #   （需要一堆我们没注入的 hook），此时直接关掉 SUSFS 保底
         echo "===== (4) 校验 hook 模式 ====="
         if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
           echo "⚠ CONFIG_KSU_MANUAL_HOOK 丢失，关闭 SUSFS 兜底"
