@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """ReSukiSU manual hook 全量注入（小米6 sagit / Linux 4.4）
 
-按官方 manual-integrate 文档一次性注入全部 hook：
-  fs/stat.c        -> ksu_handle_stat        (newfstatat / fstatat64)
-  fs/stat.c        -> ksu_handle_newfstat_ret
-  fs/stat.c        -> ksu_handle_fstat64_ret
-  kernel/reboot.c  -> ksu_handle_sys_reboot
-  fs/read_write.c  -> ksu_handle_vfs_read    (默认关闭)
-  fs/devpts/inode.c-> ksu_handle_devpts      (默认关闭)
+注入:
+  fs/stat.c       -> ksu_handle_stat        (newfstatat / fstatat64)
+  fs/stat.c       -> ksu_handle_newfstat_ret
+  fs/stat.c       -> ksu_handle_fstat64_ret
+  kernel/reboot.c -> ksu_handle_sys_reboot
+  fs/read_write.c -> ksu_handle_vfs_read   (默认关闭)
+  fs/devpts/inode.c -> ksu_handle_devpts   (默认关闭)
 
 原则：幂等 / 每个 hook 独立容错 / 全包 #ifdef CONFIG_KSU_MANUAL_HOOK / C89 安全
 """
@@ -64,7 +64,6 @@ def find_body(src, sig):
 
 
 def ensure_decl(src, decl, guards):
-    """guards 全部命中才跳过；任一缺失就插入整块声明"""
     if all(g in src for g in guards):
         return src, False, '声明已存在'
     lines = src.split('\n')
@@ -161,7 +160,6 @@ def work(name, candidates, sig_list, decl, decl_guards,
         print('   · %s 无需改动' % path)
 
 
-# ══════════ fs/stat.c : newfstatat / fstatat64 ══════════
 work('stat_hook', ['fs/stat.c'],
      ['SYSCALL_DEFINE4(newfstatat,', 'SYSCALL_DEFINE4(fstatat64,'],
      """#ifdef CONFIG_KSU_MANUAL_HOOK
@@ -181,7 +179,6 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
      ['ksu_handle_stat(&dfd', 'ksu_handle_stat(&dfd'],
      mode='decl')
 
-# ══════════ fs/stat.c : newfstat / fstat64 ══════════
 work('newfstat_ret', ['fs/stat.c'],
      ['SYSCALL_DEFINE2(newfstat,'],
      """#ifdef CONFIG_KSU_MANUAL_HOOK
@@ -209,7 +206,6 @@ work('fstat64_ret', ['fs/stat.c'],
      ['ksu_handle_fstat64_ret(&fd'],
      mode='return')
 
-# ══════════ reboot hook ══════════
 work('sys_reboot', ['kernel/reboot.c', 'kernel/sys.c'],
      ['SYSCALL_DEFINE4(reboot,'],
      """#ifdef CONFIG_KSU_MANUAL_HOOK
@@ -224,7 +220,6 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void 
      ['ksu_handle_sys_reboot(magic1'],
      mode='decl')
 
-# ══════════ 可选 ══════════
 work('vfs_read', ['fs/read_write.c'], ['ssize_t vfs_read('],
      """#ifdef CONFIG_KSU_MANUAL_HOOK
 extern bool ksu_vfs_read_hook __read_mostly;
