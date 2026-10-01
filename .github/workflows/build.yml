@@ -30,7 +30,6 @@ jobs:
         sudo ln -sf /usr/bin/python3 /usr/bin/python || true
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
-    # ★ 先轻量列出分支里真实的 clang-* 目录，再只拉那一个
     - name: 下载 clang
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
@@ -39,8 +38,7 @@ jobs:
         URL=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
         BR="${{ env.CLANG_BRANCH }}"
         WANT="${{ env.CLANG_DIR }}"
-
-        echo "==> ① 列出 $BR 分支下的 clang 目录（不下载内容）"
+        echo "==> 列出 $BR 分支下的 clang 目录"
         timeout 600 git clone -q --depth=1 --filter=blob:none --no-checkout \
           --single-branch -b "$BR" "$URL" clang-aosp
         DIRS=""
@@ -50,17 +48,12 @@ jobs:
           cd ..
         fi
         echo "$DIRS" | sed 's/^/    /'
-
         TARGET="$WANT"
-        if [ -n "$DIRS" ]; then
-          if ! echo "$DIRS" | grep -qx "$TARGET"; then
-            echo "⚠ $TARGET 不在该分支，自动挑选"
-            TARGET=$(echo "$DIRS" | grep -E '^clang-r' | sort -V | tail -1)
-            [ -z "$TARGET" ] && TARGET=$(echo "$DIRS" | head -1)
-          fi
+        if [ -n "$DIRS" ] && ! echo "$DIRS" | grep -qx "$TARGET"; then
+          TARGET=$(echo "$DIRS" | grep -E '^clang-r' | sort -V | tail -1)
+          [ -z "$TARGET" ] && TARGET=$(echo "$DIRS" | head -1)
         fi
         echo "==> 使用目录: $TARGET"
-
         if [ -n "$TARGET" ] && [ -d clang-aosp/.git ]; then
           cd clang-aosp
           git sparse-checkout init --cone 2>/dev/null || git sparse-checkout init 2>/dev/null
@@ -68,28 +61,22 @@ jobs:
           git checkout -q 2>/dev/null || git checkout 2>/dev/null
           cd ..
         fi
-
         if [ ! -f "clang-aosp/$TARGET/bin/clang" ]; then
-          echo "⚠ sparse 失败，回退全量 clone（较慢）"
+          echo "⚠ sparse 失败，回退全量 clone"
           rm -rf clang-aosp
           timeout 1500 git clone -q --depth=1 --single-branch -b "$BR" "$URL" clang-aosp
           if [ ! -f "clang-aosp/$TARGET/bin/clang" ]; then
-            echo "==> 全量后重新探测实际目录"
-            FOUND=$(ls -d clang-aosp/clang-* 2>/dev/null | grep -E "$TARGET|clang-r" | head -1)
-            if [ -n "$FOUND" ]; then TARGET=$(basename "$FOUND"); fi
+            FOUND=$(ls -d clang-aosp/clang-* 2>/dev/null | head -1)
+            [ -n "$FOUND" ] && TARGET=$(basename "$FOUND")
           fi
         fi
-
         if [ ! -f "clang-aosp/$TARGET/bin/clang" ]; then
-          echo "::error::clang 下载失败: clang-aosp/$TARGET/bin/clang"
+          echo "::error::clang 下载失败"
           ls -la clang-aosp/ 2>/dev/null || true
           exit 1
         fi
-
         chmod +x "clang-aosp/$TARGET/bin/clang"
-        # 把目录名传给后续步骤
         echo "$TARGET" > $GITHUB_WORKSPACE/kernel_workspace/clang_dir.txt
-        echo "==> clang 版本:"
         "clang-aosp/$TARGET/bin/clang" --version
 
     - name: 下载内核源码
@@ -141,7 +128,6 @@ jobs:
           echo "⚠ 所有 SUSFS 源均失败，降级为仅 ReSukiSU"
           echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
         else
-          echo "--- kernel_patches 列表 ---"
           ls susfs/kernel_patches/ || true
         fi
 
@@ -168,6 +154,7 @@ jobs:
         grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
         echo "✅ SUSFS 文件已注入"
 
+    # ★ 用 strip_patch.py 剔除 kernel/sys.c 段，替代 patch 不支持的 --exclude
     - name: 应用 SUSFS 内核补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -186,22 +173,21 @@ jobs:
           echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
           exit 0
         fi
-        echo "==> 使用补丁: $P"
+        echo "==> 原补丁: $P"
+        python3 ${{ github.workspace }}/scripts/strip_patch.py \
+          "$P" ../susfs_patch_stripped.patch kernel/sys.c
+        echo "==> 剔除 sys.c 后应用补丁"
         patch -p1 --fuzz=5 --no-backup-if-mismatch \
-          --exclude=kernel/sys.c \
-          < "$P" || echo "⚠ 补丁部分冲突"
+          < ../susfs_patch_stripped.patch || echo "⚠ 补丁部分冲突"
         REJ=$(find . -name "*.rej" 2>/dev/null || true)
         if [ -n "$REJ" ]; then
-          echo "===== 冲突残留 .rej 内容 ====="
-          for r in $REJ; do
-            echo "----------- $r -----------"
-            cat "$r" || true
-          done
+          echo "===== 冲突残留 ====="
+          for r in $REJ; do echo "--- $r ---"; cat "$r" || true; done
           if echo "$REJ" | grep -qi "kallsyms"; then
-            echo "⚠ kallsyms.c 冲突（关键文件），降级为仅 ReSukiSU"
+            echo "⚠ kallsyms.c 冲突，降级为仅 ReSukiSU"
             echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
           else
-            echo "⚠ 仅非关键文件冲突，继续编译"
+            echo "⚠ 非关键冲突，继续"
           fi
           find . -name "*.rej" -delete 2>/dev/null || true
           find . -name "*.orig" -delete 2>/dev/null || true
@@ -217,7 +203,7 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         if [ -d KernelSU ]; then KSU_DIR=KernelSU; else KSU_DIR=drivers/kernelsu; fi
         if [ ! -d "$KSU_DIR" ]; then
-          echo "⚠ 未找到 $KSU_DIR，降级为仅 ReSukiSU"
+          echo "⚠ 未找到 $KSU_DIR，降级"
           echo "ENABLE_SUSFS=false" >> $GITHUB_ENV
           exit 0
         fi
@@ -227,12 +213,12 @@ jobs:
           PATCHES=$(ls ../../susfs/kernel_patches/10_enable_susfs_for_ksu.patch 2>/dev/null || true)
         fi
         if [ -z "$PATCHES" ]; then
-          echo "⚠ 无 KSU 侧补丁，继续编译"
+          echo "⚠ 无 KSU 侧补丁，继续"
           exit 0
         fi
         for p in $PATCHES; do
           if [ ! -f "$p" ]; then continue; fi
-          echo "==> 打补丁 $p"
+          echo "==> $p"
           patch -p1 --fuzz=5 < "$p" || echo "⚠ 冲突: $p"
         done
         exit 0
@@ -245,21 +231,13 @@ jobs:
         python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
         exit 0
 
-    - name: 修复 execveat hook
+    # ★ 保守修复：只有 hook 完全缺失才动手，绝不再误改
+    - name: 修复 KSU hook（exec / open）
       if: env.ENABLE_KERNELSU == 'true'
       run: |
         set +e
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        python3 ${{ github.workspace }}/scripts/fix_exec_hook.py .
-        exit 0
-
-    # ★ 本次新增：修复被 SUSFS 补丁破坏的 faccessat hook
-    - name: 修复 faccessat hook
-      if: env.ENABLE_KERNELSU == 'true'
-      run: |
-        set +e
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        python3 ${{ github.workspace }}/scripts/fix_open_hook.py .
+        python3 ${{ github.workspace }}/scripts/repair_ksu_hooks.py .
         exit 0
 
     - name: 探测 SUSFS 补丁覆盖范围
@@ -267,13 +245,10 @@ jobs:
       run: |
         set +e
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        echo "===== 各文件 susfs 补丁命中情况 ====="
+        echo "===== susfs 命中情况 ====="
         for f in kernel/sys.c kernel/kallsyms.c fs/stat.c fs/open.c fs/read_write.c fs/namei.c fs/exec.c; do
           if [ -f "$f" ] && grep -qi "susfs" "$f"; then
-            echo "  [命中] $f"
-          else
-            echo "  [未中] $f"
-          fi
+            echo "  [命中] $f"; else echo "  [未中] $f"; fi
         done
         exit 0
 
@@ -299,7 +274,6 @@ jobs:
       id: build
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        # 从文件读取实际 clang 目录名（由下载步骤写入）
         CLANG_DIR=$(cat $GITHUB_WORKSPACE/kernel_workspace/clang_dir.txt)
         echo "使用 clang 目录: $CLANG_DIR"
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/$CLANG_DIR/bin:$PATH
@@ -307,12 +281,10 @@ jobs:
         clang --version
         touch build.log
 
-        echo "===== (1) 生成 defconfig ====="
+        echo "===== (1) defconfig ====="
         make O=out ARCH=arm64 ${{ env.KERNEL_DEFCONFIG }} 2>&1 | tail -20
-
-        echo "===== (2) 叠加 sagit 片段 ====="
+        echo "===== (2) 叠加片段 ====="
         cat ${{ env.KERNEL_FRAGMENT }} >> out/.config
-
         cat >> out/.config <<'EOF'
         CONFIG_LOCALVERSION="-ReSukiSU"
         # CONFIG_CC_WERROR is not set
@@ -321,12 +293,10 @@ jobs:
         CONFIG_KPROBES=y
         CONFIG_KPROBE_EVENTS=y
         EOF
-
         if [ "${{ env.ENABLE_KERNELSU }}" = "true" ]; then
           echo "CONFIG_KSU=y" >> out/.config
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
         fi
-
         if [ "${{ env.ENABLE_SUSFS }}" = "true" ]; then
           echo "CONFIG_KSU_SUSFS=y" >> out/.config
           if [ "${{ env.SUSFS_SUS_PATH }}" = "true" ]; then
@@ -353,15 +323,14 @@ jobs:
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> out/.config; fi
           if [ "${{ env.SUSFS_SPOOF_STAT }}" = "true" ] && grep -qi "susfs" fs/stat.c; then
             echo "CONFIG_KSU_SUSFS_SPOOF_STAT=y" >> out/.config
-            echo "  ✓ SPOOF_STAT 已开启"; else echo "  · SPOOF_STAT 跳过"; fi
+            echo "  ✓ SPOOF_STAT"; else echo "  · SPOOF_STAT 跳过"; fi
           if [ "${{ env.SUSFS_SPOOF_UNAME }}" = "true" ] && grep -qi "susfs" kernel/sys.c; then
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
-            echo "  ✓ SPOOF_UNAME 已开启"; else echo "  · SPOOF_UNAME 跳过"; fi
+            echo "  ✓ SPOOF_UNAME"; else echo "  · SPOOF_UNAME 跳过"; fi
           if [ "${{ env.SUSFS_HIDE_SYMBOLS }}" = "true" ] && grep -qi "susfs" kernel/kallsyms.c; then
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
-            echo "  ✓ HIDE_SYMBOLS 已开启"; else echo "  · HIDE_SYMBOLS 跳过"; fi
+            echo "  ✓ HIDE_SYMBOLS"; else echo "  · HIDE_SYMBOLS 跳过"; fi
         fi
-
         if [ -n "${{ env.EXTRA_CONFIG }}" ]; then
           echo "${{ env.EXTRA_CONFIG }}" >> out/.config
         fi
@@ -371,7 +340,7 @@ jobs:
 
         echo "===== (4) 校验 hook 模式 ====="
         if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-          echo "⚠ CONFIG_KSU_MANUAL_HOOK 丢失，关闭 SUSFS 兜底"
+          echo "⚠ MANUAL_HOOK 丢失，关闭 SUSFS 兜底"
           sed -i '/^CONFIG_KSU_SUSFS/d' out/.config
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
           make O=out ARCH=arm64 olddefconfig 2>&1 | tail -10
@@ -379,34 +348,31 @@ jobs:
           echo "✅ MANUAL_HOOK 已保留"
         fi
 
-        echo "===== (5) 确认生效的配置 ====="
+        echo "===== (5) 生效配置 ====="
         grep -E "CONFIG_KSU" out/.config || echo "(无)"
 
-        echo "===== (6) 正式编译 ====="
+        echo "===== (6) 编译 ====="
         make -j$(nproc --all) \
-          CC="ccache clang" \
-          O=out \
-          ARCH=arm64 \
+          CC="ccache clang" O=out ARCH=arm64 \
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
           > build.log 2>&1
         echo "make 退出码: $?"
 
-        echo "===== ReSukiSU hook 检查结果 ====="
+        echo "===== ReSukiSU hook 检查 ====="
         grep -E "ReSukiSU|You lost|manual_hook|inline_hook" build.log | head -30 || true
 
         if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
-          echo "########## 全部 error 行 ##########"
-          grep -nE "error:|Error [0-9]+|fatal error|undefined reference|No such file" build.log | head -40 || true
-          echo "########## 第一个 error 上下文 ##########"
+          echo "########## error 行 ##########"
+          grep -nE "error:|Error [0-9]+|fatal error|undefined reference" build.log | head -40 || true
           FIRST=$(grep -n "error:" build.log | head -1 | cut -d: -f1 || true)
           if [ -n "$FIRST" ]; then
             S=$((FIRST>20 ? FIRST-20 : 1))
             sed -n "${S},$((FIRST+20))p" build.log
           fi
-          echo "########## 日志末尾 60 行 ##########"
+          echo "########## 末尾 60 行 ##########"
           tail -60 build.log
-          echo "::error::编译失败，完整日志见 artifact build-log"
+          echo "::error::编译失败"
           exit 1
         fi
         ls -lh out/arch/arm64/boot/Image.gz-dtb
@@ -429,7 +395,7 @@ jobs:
         sed -i 's!^is_slot_device=.*!is_slot_device=0;!g' AnyKernel3/anykernel.sh
         sed -i 's!^BLOCK=.*!BLOCK=auto;!g' AnyKernel3/anykernel.sh
         sed -i 's!^block=.*!block=auto;!g' AnyKernel3/anykernel.sh
-        echo "===== 打包前确认关键行 ====="
+        echo "===== 打包前确认 ====="
         grep -nE "^(BLOCK|block|IS_SLOT_DEVICE|is_slot_device|do.devicecheck|DO.DEVICECHECK)" AnyKernel3/anykernel.sh || true
         cp android-kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
         rm -rf AnyKernel3/.git* AnyKernel3/README.md \
