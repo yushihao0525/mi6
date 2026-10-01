@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """诊断 mnt_id 重复定义的来源（只打印，不修改任何文件）"""
 import os, sys, re
+from collections import Counter
 
 root = sys.argv[1] if len(sys.argv) > 1 else '.'
 os.chdir(root)
 
-print("===== 在头文件中查找 mnt_id 定义 =====")
+print("===== 在源码中查找 mnt_id 定义 =====")
 hits = []
 for dirpath, dirnames, filenames in os.walk('.'):
     dirnames[:] = [d for d in dirnames if d not in ('.git', 'out', '.cache')]
@@ -30,11 +31,9 @@ for dirpath, dirnames, filenames in os.walk('.'):
             pass
 
 if not hits:
-    print("未在源码中找到无 extern 的 mnt_id 定义")
-    print("（可能来自 SUSFS 补丁修改的头文件，见下方汇总）")
+    print("未找到无 extern 的 mnt_id 定义")
 else:
     print("找到 %d 处:" % len(hits))
-    from collections import Counter
     c = Counter(p for p, _, _ in hits)
     for p, n in c.most_common(20):
         print("   %-50s %d 处" % (p, n))
