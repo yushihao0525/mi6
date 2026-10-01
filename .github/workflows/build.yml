@@ -96,12 +96,6 @@ jobs:
         echo "--- KSU 目录 ---"
         if [ -d KernelSU ]; then ls KernelSU; else ls drivers/kernelsu; fi
 
-    - name: 注入 ReSukiSU manual hook
-      if: env.ENABLE_KERNELSU == 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        python3 ${{ github.workspace }}/scripts/inject_ksu_hooks.py .
-
     - name: 下载 SUSFS（多源回退）
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -154,7 +148,8 @@ jobs:
         grep -q "susfs.o" $K/fs/Makefile || echo "obj-y += susfs.o" >> $K/fs/Makefile
         echo "✅ SUSFS 文件已注入"
 
-    # 剔除 sys.c / kallsyms.c（4.4 上必冲突），其余全打，冲突只清理不降级
+    # ★ 顺序关键：SUSFS 补丁必须打在"未被 KSU hook 改动"的干净源码上
+    #   否则 include hunk 匹配失败 → 代码进去了但 include 丢了
     - name: 应用 SUSFS 内核补丁
       if: env.ENABLE_SUSFS == 'true'
       run: |
@@ -229,12 +224,30 @@ jobs:
         python3 ${{ github.workspace }}/scripts/fix_ksu_kconfig.py .
         exit 0
 
+    # ★ 移到 SUSFS 补丁之后
+    - name: 注入 ReSukiSU manual hook
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/inject_ksu_hooks.py .
+
     - name: 修复 KSU hook（exec / open）
       if: env.ENABLE_KERNELSU == 'true'
       run: |
         set +e
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         python3 ${{ github.workspace }}/scripts/repair_ksu_hooks.py .
+        exit 0
+
+    # ★ 兜底：补齐 susfs.h 的 include
+    - name: 补齐 susfs.h 引用
+      if: env.ENABLE_SUSFS == 'true'
+      run: |
+        set +e
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        python3 ${{ github.workspace }}/scripts/ensure_susfs_include.py .
+        echo "--- 校验 fs/stat.c ---"
+        grep -n "linux/susfs.h" fs/stat.c || echo "⚠ fs/stat.c 仍无 susfs.h"
         exit 0
 
     - name: 诊断 mnt_id 重复定义
