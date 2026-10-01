@@ -237,7 +237,6 @@ jobs:
         python3 ${{ github.workspace }}/scripts/repair_ksu_hooks.py .
         exit 0
 
-    # ★ 新增：诊断 mnt_id 重复定义来源
     - name: 诊断 mnt_id 重复定义
       run: |
         set +e
@@ -272,7 +271,7 @@ jobs:
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2.11
       with:
-        key: build-kernel-sagit-44-resukisu-susfs-fcommon
+        key: build-kernel-sagit-44-resukisu-susfs-clang12
         max-size: 2G
 
     - name: 编译内核
@@ -356,7 +355,7 @@ jobs:
         echo "===== (5) 生效配置 ====="
         grep -E "CONFIG_KSU" out/.config || echo "(无)"
 
-        echo "===== (6) 编译（KCFLAGS=-fcommon 修复 mnt_id 重复定义）====="
+        echo "===== (6) 编译 ====="
         make -j$(nproc --all) \
           CC="ccache clang" \
           O=out \
